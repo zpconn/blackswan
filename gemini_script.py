@@ -37,6 +37,10 @@ DEFAULT_CONFIG = {
         "alpha": 0.10,
         "lambda": 0.50,
         "shortfall_floor": None,
+        "objective_mode": "cvar_shortfall",
+        "max_ruin_probability": 0.005,
+        "log_utility_wealth_floor": 1.0,
+        "consensus_tolerance": 0.002,
     },
     "beliefs": {
         "prob_crash": 0.80,
@@ -50,6 +54,7 @@ DEFAULT_CONFIG = {
 }
 
 SUPPORTED_DISTRIBUTIONS = {"beta", "triangular", "uniform", "lognormal"}
+SUPPORTED_OBJECTIVES = {"cvar_shortfall", "expected_log_utility", "consensus"}
 
 
 def _deep_merge(base, overrides):
@@ -176,6 +181,15 @@ def validate_config(config):
         raise ValueError("risk.lambda must be >= 0.")
     if risk["shortfall_floor"] is not None and risk["shortfall_floor"] < 0:
         raise ValueError("risk.shortfall_floor must be >= 0 or None.")
+    if risk["objective_mode"] not in SUPPORTED_OBJECTIVES:
+        allowed = ", ".join(sorted(SUPPORTED_OBJECTIVES))
+        raise ValueError(f"risk.objective_mode must be one of: {allowed}")
+    if not (0.0 <= risk["max_ruin_probability"] <= 1.0):
+        raise ValueError("risk.max_ruin_probability must be in [0, 1].")
+    if risk["log_utility_wealth_floor"] <= 0:
+        raise ValueError("risk.log_utility_wealth_floor must be > 0.")
+    if not (0.0 <= risk["consensus_tolerance"] <= 1.0):
+        raise ValueError("risk.consensus_tolerance must be in [0, 1].")
 
     required_belief_keys = (
         "prob_crash",
@@ -500,6 +514,46 @@ def _simulate_strategy_fraction(fraction_sold, universe, config):
     return final_net_worth, ruined
 
 
+def _objective_key_for_mode(objective_mode):
+    if objective_mode == "cvar_shortfall":
+        return "cvar_objective_score"
+    if objective_mode == "expected_log_utility":
+        return "log_utility_score"
+    if objective_mode == "consensus":
+        return "consensus_score"
+    raise ValueError(f"Unsupported objective mode: {objective_mode}")
+
+
+def _objective_label(objective_mode):
+    if objective_mode == "cvar_shortfall":
+        return "Mean - lambda*CVaR"
+    if objective_mode == "expected_log_utility":
+        return "E[log(wealth)]"
+    if objective_mode == "consensus":
+        return "Consensus score"
+    raise ValueError(f"Unsupported objective mode: {objective_mode}")
+
+
+def _format_objective_for_table(value, objective_mode):
+    if objective_mode == "cvar_shortfall":
+        return f"${value:15,.0f}"
+    if objective_mode == "expected_log_utility":
+        return f"{value:16.6f}"
+    if objective_mode == "consensus":
+        return f"{value:16.6%}"
+    raise ValueError(f"Unsupported objective mode: {objective_mode}")
+
+
+def _format_objective_for_summary(value, objective_mode):
+    if objective_mode == "cvar_shortfall":
+        return f"${value:,.0f}"
+    if objective_mode == "expected_log_utility":
+        return f"{value:.6f}"
+    if objective_mode == "consensus":
+        return f"{(-value):.6%} max regret (lower is better)"
+    raise ValueError(f"Unsupported objective mode: {objective_mode}")
+
+
 def _score_strategy(final_net_worth, ruined, config):
     risk = config["risk"]
     portfolio = config["portfolio"]
@@ -514,14 +568,174 @@ def _score_strategy(final_net_worth, ruined, config):
 
     shortfall = np.maximum(0.0, shortfall_floor - final_net_worth)
     cvar_shortfall = _compute_cvar(shortfall, risk["alpha"])
-    score = mean_final_net_worth - risk["lambda"] * cvar_shortfall
+    cvar_objective_score = mean_final_net_worth - risk["lambda"] * cvar_shortfall
+
+    floored_wealth = np.maximum(final_net_worth, risk["log_utility_wealth_floor"])
+    log_utility_score = float(np.mean(np.log(floored_wealth)))
+
+    objective_mode = risk["objective_mode"]
+    if objective_mode == "cvar_shortfall":
+        display_score = cvar_objective_score
+    elif objective_mode == "expected_log_utility":
+        display_score = log_utility_score
+    else:
+        # Consensus selection is computed after evaluating all fractions.
+        display_score = 0.0
 
     return {
         "expected_final_net_worth": mean_final_net_worth,
         "p10_final_net_worth": p10_final_net_worth,
         "cvar_shortfall": cvar_shortfall,
         "ruin_probability": ruin_probability,
-        "score": score,
+        "cvar_objective_score": cvar_objective_score,
+        "log_utility_score": log_utility_score,
+        "score": display_score,
+    }
+
+
+def _eligible_indices_for_guardrail(diagnostics, max_ruin_probability):
+    eligible_indices = [
+        idx for idx, item in enumerate(diagnostics) if item["ruin_probability"] <= max_ruin_probability
+    ]
+    if not eligible_indices:
+        raise ValueError(
+            "No strategy satisfies the ruin probability guardrail. "
+            f"Increase risk.max_ruin_probability (currently {max_ruin_probability:.2%}) or adjust assumptions."
+        )
+    return eligible_indices
+
+
+def _select_best_strategy(diagnostics, objective_mode, max_ruin_probability):
+    objective_key = _objective_key_for_mode(objective_mode)
+    eligible_indices = _eligible_indices_for_guardrail(diagnostics, max_ruin_probability)
+
+    sorted_indices = sorted(
+        eligible_indices,
+        key=lambda idx: diagnostics[idx][objective_key],
+        reverse=True,
+    )
+
+    best_idx = sorted_indices[0]
+    second_idx = sorted_indices[1] if len(sorted_indices) > 1 else best_idx
+
+    left_delta = None
+    right_delta = None
+    best_pos = eligible_indices.index(best_idx)
+    if best_pos > 0:
+        left_idx = eligible_indices[best_pos - 1]
+        left_delta = diagnostics[best_idx][objective_key] - diagnostics[left_idx][objective_key]
+    if best_pos < len(eligible_indices) - 1:
+        right_idx = eligible_indices[best_pos + 1]
+        right_delta = diagnostics[best_idx][objective_key] - diagnostics[right_idx][objective_key]
+
+    local_margin = None
+    if left_delta is not None and right_delta is not None:
+        local_margin = min(left_delta, right_delta)
+    elif left_delta is not None:
+        local_margin = left_delta
+    elif right_delta is not None:
+        local_margin = right_delta
+
+    best = diagnostics[best_idx]
+    second_best = diagnostics[second_idx]
+    top_candidates = [diagnostics[idx] for idx in sorted_indices[:5]]
+
+    return {
+        "objective_mode": objective_mode,
+        "objective_key": objective_key,
+        "objective_score": best[objective_key],
+        "recommended_fraction": best["fraction_sold_today"],
+        "expected_final_net_worth": best["expected_final_net_worth"],
+        "cvar_shortfall": best["cvar_shortfall"],
+        "ruin_probability": best["ruin_probability"],
+        "log_utility_score": best["log_utility_score"],
+        "cvar_objective_score": best["cvar_objective_score"],
+        "score_gap_vs_second_best": best[objective_key] - second_best[objective_key],
+        "local_score_margin": local_margin,
+        "eligible_strategies": len(eligible_indices),
+        "top_candidates": top_candidates,
+    }
+
+
+def _normalized_regret(best_value, candidate_value):
+    scale = max(abs(best_value), 1.0)
+    return max(0.0, (best_value - candidate_value) / scale)
+
+
+def _select_consensus_strategy(diagnostics, max_ruin_probability, consensus_tolerance):
+    objective_mode = "consensus"
+    objective_key = _objective_key_for_mode(objective_mode)
+    eligible_indices = _eligible_indices_for_guardrail(diagnostics, max_ruin_probability)
+
+    best_cvar = max(diagnostics[idx]["cvar_objective_score"] for idx in eligible_indices)
+    best_log = max(diagnostics[idx]["log_utility_score"] for idx in eligible_indices)
+
+    enriched = []
+    for idx in eligible_indices:
+        item = diagnostics[idx]
+        cvar_regret = _normalized_regret(best_cvar, item["cvar_objective_score"])
+        log_regret = _normalized_regret(best_log, item["log_utility_score"])
+        max_regret = max(cvar_regret, log_regret)
+        sum_regret = cvar_regret + log_regret
+        consensus_pass = cvar_regret <= consensus_tolerance and log_regret <= consensus_tolerance
+        consensus_score = -max_regret
+        enriched.append(
+            {
+                "idx": idx,
+                "cvar_regret": cvar_regret,
+                "log_regret": log_regret,
+                "max_regret": max_regret,
+                "sum_regret": sum_regret,
+                "consensus_pass": consensus_pass,
+                "consensus_score": consensus_score,
+            }
+        )
+
+    pass_pool = [entry for entry in enriched if entry["consensus_pass"]]
+    used_fallback = False
+    candidate_pool = pass_pool
+    if not candidate_pool:
+        candidate_pool = enriched
+        used_fallback = True
+
+    sorted_entries = sorted(
+        candidate_pool,
+        key=lambda entry: (
+            entry["max_regret"],
+            entry["sum_regret"],
+            -diagnostics[entry["idx"]]["cvar_objective_score"],
+            -diagnostics[entry["idx"]]["log_utility_score"],
+        ),
+    )
+
+    best_entry = sorted_entries[0]
+    second_entry = sorted_entries[1] if len(sorted_entries) > 1 else best_entry
+
+    best_idx = best_entry["idx"]
+    best = diagnostics[best_idx]
+    second_best = diagnostics[second_entry["idx"]]
+    top_candidates = [diagnostics[entry["idx"]] for entry in sorted_entries[:5]]
+
+    return {
+        "objective_mode": objective_mode,
+        "objective_key": objective_key,
+        "objective_score": best_entry["consensus_score"],
+        "recommended_fraction": best["fraction_sold_today"],
+        "expected_final_net_worth": best["expected_final_net_worth"],
+        "cvar_shortfall": best["cvar_shortfall"],
+        "ruin_probability": best["ruin_probability"],
+        "log_utility_score": best["log_utility_score"],
+        "cvar_objective_score": best["cvar_objective_score"],
+        "score_gap_vs_second_best": best_entry["consensus_score"] - second_entry["consensus_score"],
+        "local_score_margin": None,
+        "eligible_strategies": len(eligible_indices),
+        "top_candidates": top_candidates,
+        "consensus_tolerance": consensus_tolerance,
+        "consensus_within_tolerance_count": len(pass_pool),
+        "consensus_used_fallback": used_fallback,
+        "consensus_max_regret": best_entry["max_regret"],
+        "consensus_cvar_regret": best_entry["cvar_regret"],
+        "consensus_log_regret": best_entry["log_regret"],
     }
 
 
@@ -540,6 +754,12 @@ def run_monte_carlo_optimization(config=None, verbose=True):
     )
 
     diagnostics = []
+
+    primary_objective_mode = risk["objective_mode"]
+    objective_label = _objective_label(primary_objective_mode)
+    objective_label_for_table = objective_label
+    if primary_objective_mode == "consensus":
+        objective_label_for_table = "Mean - lambda*CVaR"
 
     if verbose:
         summary = universe["summary"]
@@ -563,7 +783,7 @@ def run_monte_carlo_optimization(config=None, verbose=True):
             f"{'Portion Sold Today':>20} | "
             f"{'Expected Final Wealth':>24} | "
             f"{cvar_label:>17} | "
-            f"{'Objective Score':>16}"
+            f"{objective_label_for_table:>16}"
         )
         print("-" * 92)
 
@@ -574,52 +794,63 @@ def run_monte_carlo_optimization(config=None, verbose=True):
         diagnostics.append(metrics)
 
         if verbose and round(fraction * 100) % 10 == 0:
+            objective_display_value = metrics["score"]
+            objective_display_mode = primary_objective_mode
+            if primary_objective_mode == "consensus":
+                objective_display_value = metrics["cvar_objective_score"]
+                objective_display_mode = "cvar_shortfall"
+            objective_display = _format_objective_for_table(objective_display_value, objective_display_mode)
             print(
                 f"{fraction * 100:19.0f}% | "
                 f"${metrics['expected_final_net_worth']:23,.0f} | "
                 f"${metrics['cvar_shortfall']:16,.0f} | "
-                f"${metrics['score']:15,.0f}"
+                f"{objective_display}"
             )
 
-    scores = np.array([item["score"] for item in diagnostics], dtype=np.float64)
-    best_idx = int(np.argmax(scores))
-    sorted_idx = np.argsort(scores)[::-1]
+    cvar_selection = _select_best_strategy(
+        diagnostics,
+        "cvar_shortfall",
+        risk["max_ruin_probability"],
+    )
+    log_selection = _select_best_strategy(
+        diagnostics,
+        "expected_log_utility",
+        risk["max_ruin_probability"],
+    )
+    consensus_selection = _select_consensus_strategy(
+        diagnostics,
+        risk["max_ruin_probability"],
+        risk["consensus_tolerance"],
+    )
 
-    best = diagnostics[best_idx]
-    second_best = diagnostics[int(sorted_idx[1])] if len(sorted_idx) > 1 else best
-    top_idx = sorted_idx[:5]
-    top_candidates = [diagnostics[int(i)] for i in top_idx]
-
-    left_delta = None
-    right_delta = None
-    if best_idx > 0:
-        left_delta = best["score"] - diagnostics[best_idx - 1]["score"]
-    if best_idx < len(diagnostics) - 1:
-        right_delta = best["score"] - diagnostics[best_idx + 1]["score"]
-
-    local_margin = None
-    if left_delta is not None and right_delta is not None:
-        local_margin = min(left_delta, right_delta)
-    elif left_delta is not None:
-        local_margin = left_delta
-    elif right_delta is not None:
-        local_margin = right_delta
+    mode_to_selection = {
+        "cvar_shortfall": cvar_selection,
+        "expected_log_utility": log_selection,
+        "consensus": consensus_selection,
+    }
+    primary_selection = mode_to_selection[primary_objective_mode]
+    secondary_modes = [mode for mode in ("cvar_shortfall", "expected_log_utility", "consensus") if mode != primary_objective_mode]
 
     result = {
-        "recommended_fraction": best["fraction_sold_today"],
-        "objective_score": best["score"],
-        "expected_final_net_worth": best["expected_final_net_worth"],
-        "cvar_shortfall": best["cvar_shortfall"],
-        "ruin_probability": best["ruin_probability"],
-        "score_gap_vs_second_best": best["score"] - second_best["score"],
-        "local_score_margin": local_margin,
-        "top_candidates": top_candidates,
+        "recommended_fraction": primary_selection["recommended_fraction"],
+        "objective_score": primary_selection["objective_score"],
+        "expected_final_net_worth": primary_selection["expected_final_net_worth"],
+        "cvar_shortfall": primary_selection["cvar_shortfall"],
+        "ruin_probability": primary_selection["ruin_probability"],
+        "score_gap_vs_second_best": primary_selection["score_gap_vs_second_best"],
+        "local_score_margin": primary_selection["local_score_margin"],
+        "top_candidates": primary_selection["top_candidates"],
+        "primary_objective_mode": primary_objective_mode,
+        "max_ruin_probability": risk["max_ruin_probability"],
+        "objective_comparison": mode_to_selection,
         "diagnostics_by_fraction": diagnostics,
         "universe_summary": universe["summary"],
     }
 
     if verbose:
         print("-" * 92)
+        print(f"Primary objective mode:                {primary_objective_mode}")
+        print(f"Ruin probability guardrail:            <= {risk['max_ruin_probability']:.2%}")
         print(f"Recommended sell-today fraction:        {result['recommended_fraction'] * 100:.1f}%")
         print(f"Expected final net worth:              ${result['expected_final_net_worth']:,.0f}")
         print(
@@ -627,15 +858,59 @@ def run_monte_carlo_optimization(config=None, verbose=True):
             f"${result['cvar_shortfall']:,.0f}"
         )
         print(f"Ruin probability:                       {result['ruin_probability']:.2%}")
-        print(f"Objective score:                       ${result['objective_score']:,.0f}")
-        print(f"Score gap vs second best:              ${result['score_gap_vs_second_best']:,.0f}")
-        if result["local_score_margin"] is not None:
-            print(f"Local score margin around optimum:     ${result['local_score_margin']:,.0f}")
+        if primary_objective_mode == "consensus":
+            print(
+                "Consensus max regret:                  "
+                f"{primary_selection['consensus_max_regret']:.6%}"
+            )
+            print(
+                "Consensus tolerance:                   "
+                f"{primary_selection['consensus_tolerance']:.6%}"
+            )
+            print(
+                "Consensus set size (feasible):         "
+                f"{primary_selection['consensus_within_tolerance_count']}"
+            )
+            if primary_selection["consensus_used_fallback"]:
+                print("Consensus fallback used:               yes (picked closest compromise)")
+            else:
+                print("Consensus fallback used:               no")
+            print(
+                "Consensus winner margin vs second:     "
+                f"{result['score_gap_vs_second_best']:.6%} consensus-score gap"
+            )
+        else:
+            print(
+                "Objective score:                       "
+                f"{_format_objective_for_summary(result['objective_score'], primary_objective_mode)}"
+            )
+            print(
+                "Score gap vs second best:              "
+                f"{_format_objective_for_summary(result['score_gap_vs_second_best'], primary_objective_mode)}"
+            )
+            if result["local_score_margin"] is not None:
+                print(
+                    "Local score margin around optimum:     "
+                    f"{_format_objective_for_summary(result['local_score_margin'], primary_objective_mode)}"
+                )
+        print()
+        print("Secondary objective cross-checks:")
+        for mode in secondary_modes:
+            secondary_selection = mode_to_selection[mode]
+            print(f"  Mode:                                {mode}")
+            print(
+                "  Recommended sell-today fraction:     "
+                f"{secondary_selection['recommended_fraction'] * 100:.1f}%"
+            )
+            print(
+                "  Objective score:                     "
+                f"{_format_objective_for_summary(secondary_selection['objective_score'], mode)}"
+            )
         print()
         print(
             "Decision framing: based on your belief distributions and risk settings, "
             f"selling about {result['recommended_fraction'] * 100:.1f}% today is the "
-            "best one-time action under the configured objective."
+            "best one-time action under the configured objective and guardrail."
         )
 
     return result
