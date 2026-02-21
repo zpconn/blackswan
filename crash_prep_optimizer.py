@@ -1,4 +1,7 @@
+import concurrent.futures
 from copy import deepcopy
+import multiprocessing
+import os
 
 import numpy as np
 
@@ -27,6 +30,11 @@ DEFAULT_CONFIG = {
         "crash_layoff_min_duration_months": 24,
         "baseline_layoff_min_duration_months": 1,
         "baseline_layoff_max_duration_months": 12,
+        "parallel_enabled": True,
+        "parallel_workers": None,
+        "parallel_start_method": None,
+        "parallel_chunk_mode": "fractions",
+        "parallel_min_fraction_tasks": 2,
     },
     "decision_grid": {
         "min_fraction": 0.0,
@@ -55,6 +63,10 @@ DEFAULT_CONFIG = {
 
 SUPPORTED_DISTRIBUTIONS = {"beta", "triangular", "uniform", "lognormal"}
 SUPPORTED_OBJECTIVES = {"cvar_shortfall", "expected_log_utility", "consensus"}
+SUPPORTED_PARALLEL_CHUNK_MODES = {"fractions"}
+
+_PARALLEL_UNIVERSE = None
+_PARALLEL_CONFIG = None
 
 
 def _deep_merge(base, overrides):
@@ -169,6 +181,23 @@ def validate_config(config):
         raise ValueError("simulation.horizon_months must be positive or None.")
     if not isinstance(simulation["layoff_probabilities_are_annual"], bool):
         raise ValueError("simulation.layoff_probabilities_are_annual must be a bool.")
+    if not isinstance(simulation["parallel_enabled"], bool):
+        raise ValueError("simulation.parallel_enabled must be a bool.")
+    if simulation["parallel_workers"] is not None and simulation["parallel_workers"] <= 0:
+        raise ValueError("simulation.parallel_workers must be > 0 or None.")
+    if simulation["parallel_start_method"] is not None:
+        available_methods = multiprocessing.get_all_start_methods()
+        if simulation["parallel_start_method"] not in available_methods:
+            available = ", ".join(available_methods)
+            raise ValueError(
+                "simulation.parallel_start_method must be one of "
+                f"[{available}] or None."
+            )
+    if simulation["parallel_chunk_mode"] not in SUPPORTED_PARALLEL_CHUNK_MODES:
+        allowed = ", ".join(sorted(SUPPORTED_PARALLEL_CHUNK_MODES))
+        raise ValueError(f"simulation.parallel_chunk_mode must be one of: {allowed}")
+    if simulation["parallel_min_fraction_tasks"] <= 0:
+        raise ValueError("simulation.parallel_min_fraction_tasks must be > 0.")
 
     if not (0.0 <= decision_grid["min_fraction"] <= decision_grid["max_fraction"] <= 1.0):
         raise ValueError("decision_grid fractions must satisfy 0 <= min <= max <= 1.")
@@ -593,6 +622,135 @@ def _score_strategy(final_net_worth, ruined, config):
     }
 
 
+def _init_parallel_worker(universe, config):
+    global _PARALLEL_UNIVERSE
+    global _PARALLEL_CONFIG
+    _PARALLEL_UNIVERSE = universe
+    _PARALLEL_CONFIG = config
+
+
+def _evaluate_fraction_task(task):
+    idx, fraction = task
+
+    if _PARALLEL_UNIVERSE is None or _PARALLEL_CONFIG is None:
+        raise RuntimeError("Parallel worker is not initialized.")
+
+    final_net_worth, ruined = _simulate_strategy_fraction(fraction, _PARALLEL_UNIVERSE, _PARALLEL_CONFIG)
+    metrics = _score_strategy(final_net_worth, ruined, _PARALLEL_CONFIG)
+    metrics["fraction_sold_today"] = float(fraction)
+    return idx, metrics
+
+
+def _evaluate_fraction_direct(idx, fraction, universe, config):
+    final_net_worth, ruined = _simulate_strategy_fraction(fraction, universe, config)
+    metrics = _score_strategy(final_net_worth, ruined, config)
+    metrics["fraction_sold_today"] = float(fraction)
+    return idx, metrics
+
+
+def _default_parallel_start_method():
+    methods = multiprocessing.get_all_start_methods()
+    if os.name == "posix" and "fork" in methods:
+        return "fork"
+    if "spawn" in methods:
+        return "spawn"
+    return methods[0]
+
+
+def _resolve_execution_settings(config, task_count):
+    simulation = config["simulation"]
+    resolved_workers = simulation["parallel_workers"]
+    if resolved_workers is None:
+        resolved_workers = os.cpu_count() or 1
+
+    execution = {
+        "mode": "single",
+        "workers_used": 1,
+        "backend": "single",
+        "start_method": None,
+        "fraction_tasks": task_count,
+        "fallback_reason": None,
+    }
+
+    if not simulation["parallel_enabled"]:
+        return execution
+    if task_count < simulation["parallel_min_fraction_tasks"]:
+        return execution
+
+    workers_used = max(1, min(resolved_workers, task_count))
+    if workers_used <= 1:
+        return execution
+
+    execution["mode"] = "parallel"
+    execution["workers_used"] = workers_used
+    execution["backend"] = "multiprocessing"
+    execution["start_method"] = (
+        simulation["parallel_start_method"] or _default_parallel_start_method()
+    )
+    return execution
+
+
+def _collect_fraction_metrics_single_thread(fractions_to_test, universe, config):
+    diagnostics = []
+    for idx, fraction in enumerate(fractions_to_test):
+        _, metrics = _evaluate_fraction_direct(idx, fraction, universe, config)
+        diagnostics.append(metrics)
+    return diagnostics
+
+
+def _collect_fraction_metrics_parallel(fractions_to_test, universe, config, execution):
+    tasks = [(idx, float(fraction)) for idx, fraction in enumerate(fractions_to_test)]
+    futures = {}
+    results = {}
+    mp_context = multiprocessing.get_context(execution["start_method"])
+
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=execution["workers_used"],
+        mp_context=mp_context,
+        initializer=_init_parallel_worker,
+        initargs=(universe, config),
+    ) as executor:
+        for task in tasks:
+            future = executor.submit(_evaluate_fraction_task, task)
+            futures[future] = task[0]
+
+        for future in concurrent.futures.as_completed(futures):
+            idx, metrics = future.result()
+            results[idx] = metrics
+
+    return [results[idx] for idx in sorted(results)]
+
+
+def _collect_fraction_metrics(fractions_to_test, universe, config):
+    execution = _resolve_execution_settings(config, len(fractions_to_test))
+    if execution["mode"] == "parallel":
+        try:
+            diagnostics = _collect_fraction_metrics_parallel(
+                fractions_to_test,
+                universe,
+                config,
+                execution,
+            )
+        except Exception as exc:
+            execution["mode"] = "single"
+            execution["workers_used"] = 1
+            execution["backend"] = "single"
+            execution["start_method"] = None
+            execution["fallback_reason"] = str(exc)
+            diagnostics = _collect_fraction_metrics_single_thread(
+                fractions_to_test,
+                universe,
+                config,
+            )
+    else:
+        diagnostics = _collect_fraction_metrics_single_thread(
+            fractions_to_test,
+            universe,
+            config,
+        )
+    return diagnostics, execution
+
+
 def _eligible_indices_for_guardrail(diagnostics, max_ruin_probability):
     eligible_indices = [
         idx for idx, item in enumerate(diagnostics) if item["ruin_probability"] <= max_ruin_probability
@@ -753,13 +911,17 @@ def run_monte_carlo_optimization(config=None, verbose=True):
         decision_grid["num_points"],
     )
 
-    diagnostics = []
-
     primary_objective_mode = risk["objective_mode"]
     objective_label = _objective_label(primary_objective_mode)
     objective_label_for_table = objective_label
     if primary_objective_mode == "consensus":
         objective_label_for_table = "Mean - lambda*CVaR"
+
+    diagnostics, execution = _collect_fraction_metrics(
+        fractions_to_test,
+        universe,
+        merged_config,
+    )
 
     if verbose:
         summary = universe["summary"]
@@ -786,26 +948,21 @@ def run_monte_carlo_optimization(config=None, verbose=True):
             f"{objective_label_for_table:>16}"
         )
         print("-" * 92)
-
-    for fraction in fractions_to_test:
-        final_net_worth, ruined = _simulate_strategy_fraction(fraction, universe, merged_config)
-        metrics = _score_strategy(final_net_worth, ruined, merged_config)
-        metrics["fraction_sold_today"] = float(fraction)
-        diagnostics.append(metrics)
-
-        if verbose and round(fraction * 100) % 10 == 0:
-            objective_display_value = metrics["score"]
-            objective_display_mode = primary_objective_mode
-            if primary_objective_mode == "consensus":
-                objective_display_value = metrics["cvar_objective_score"]
-                objective_display_mode = "cvar_shortfall"
-            objective_display = _format_objective_for_table(objective_display_value, objective_display_mode)
-            print(
-                f"{fraction * 100:19.0f}% | "
-                f"${metrics['expected_final_net_worth']:23,.0f} | "
-                f"${metrics['cvar_shortfall']:16,.0f} | "
-                f"{objective_display}"
-            )
+        for metrics in diagnostics:
+            fraction = metrics["fraction_sold_today"]
+            if round(fraction * 100) % 10 == 0:
+                objective_display_value = metrics["score"]
+                objective_display_mode = primary_objective_mode
+                if primary_objective_mode == "consensus":
+                    objective_display_value = metrics["cvar_objective_score"]
+                    objective_display_mode = "cvar_shortfall"
+                objective_display = _format_objective_for_table(objective_display_value, objective_display_mode)
+                print(
+                    f"{fraction * 100:19.0f}% | "
+                    f"${metrics['expected_final_net_worth']:23,.0f} | "
+                    f"${metrics['cvar_shortfall']:16,.0f} | "
+                    f"{objective_display}"
+                )
 
     cvar_selection = _select_best_strategy(
         diagnostics,
@@ -845,10 +1002,19 @@ def run_monte_carlo_optimization(config=None, verbose=True):
         "objective_comparison": mode_to_selection,
         "diagnostics_by_fraction": diagnostics,
         "universe_summary": universe["summary"],
+        "execution": execution,
     }
 
     if verbose:
         print("-" * 92)
+        print(
+            f"Execution mode:                        {execution['mode']} "
+            f"({execution['backend']}, workers={execution['workers_used']})"
+        )
+        if execution["start_method"] is not None:
+            print(f"Parallel start method:                 {execution['start_method']}")
+        if execution["fallback_reason"] is not None:
+            print(f"Parallel fallback reason:              {execution['fallback_reason']}")
         print(f"Primary objective mode:                {primary_objective_mode}")
         print(f"Ruin probability guardrail:            <= {risk['max_ruin_probability']:.2%}")
         print(f"Recommended sell-today fraction:        {result['recommended_fraction'] * 100:.1f}%")
