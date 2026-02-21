@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
         "fallback_to_cpu_on_error": False,
         "sample_size": 400_000,
         "prefer_cuda_extension": True,
+        "device_scenario_generation": True,
         "refine_top_k": 5,
         "exact_temp_dir": None,
         "min_chunk_size": 32_768,
@@ -271,6 +272,8 @@ def validate_config(config):
         raise ValueError("gpu.sample_size must be > 0.")
     if not isinstance(gpu["prefer_cuda_extension"], bool):
         raise ValueError("gpu.prefer_cuda_extension must be a bool.")
+    if not isinstance(gpu["device_scenario_generation"], bool):
+        raise ValueError("gpu.device_scenario_generation must be a bool.")
     if gpu["refine_top_k"] <= 0:
         raise ValueError("gpu.refine_top_k must be > 0.")
     if gpu["exact_temp_dir"] is not None and not isinstance(gpu["exact_temp_dir"], str):
@@ -708,6 +711,128 @@ def _build_sampling_indices(total, sample_size, seed):
     return sampled
 
 
+def _distribution_upper_bound(spec):
+    if isinstance(spec, (int, float)):
+        return float(spec)
+    if not isinstance(spec, dict):
+        return None
+    dist = spec.get("dist")
+    if dist == "uniform":
+        return float(spec["high"])
+    if dist == "triangular":
+        return float(spec["right"])
+    return None
+
+
+def _distribution_mode_triplet(spec):
+    if isinstance(spec, (int, float)):
+        value = float(spec)
+        return 0, value, value, value
+    if not isinstance(spec, dict):
+        return None
+    dist = spec.get("dist")
+    if dist == "uniform":
+        low = float(spec["low"])
+        high = float(spec["high"])
+        return 1, low, high, high
+    if dist == "triangular":
+        left = float(spec["left"])
+        mode = float(spec["mode"])
+        right = float(spec["right"])
+        return 2, left, mode, right
+    return None
+
+
+def _build_synthetic_generation_params(config, horizon_months, chunk_start):
+    beliefs = config["beliefs"]
+    simulation = config["simulation"]
+    market = config["market"]
+
+    crash_start_triplet = _distribution_mode_triplet(beliefs["crash_start_month"])
+    crash_duration_triplet = _distribution_mode_triplet(beliefs["crash_duration_months"])
+    crash_severity_triplet = _distribution_mode_triplet(beliefs["crash_severity_drop"])
+    if (
+        crash_start_triplet is None
+        or crash_duration_triplet is None
+        or crash_severity_triplet is None
+        or not isinstance(beliefs["prob_crash"], (int, float))
+        or not isinstance(beliefs["prob_layoff_during_crash"], (int, float))
+        or not isinstance(beliefs["prob_layoff_baseline"], (int, float))
+    ):
+        return None
+
+    sigma = float(market["volatility_annual"] / np.sqrt(12.0))
+    monthly_market_drift = float(market["market_yield_annual"] / 12.0)
+
+    return {
+        "seed": int(simulation["seed"]),
+        "global_offset": int(chunk_start),
+        "horizon": int(horizon_months),
+        "sigma": sigma,
+        "monthly_market_drift": monthly_market_drift,
+        "prob_crash": float(beliefs["prob_crash"]),
+        "crash_start_mode": int(crash_start_triplet[0]),
+        "crash_start_a": float(crash_start_triplet[1]),
+        "crash_start_b": float(crash_start_triplet[2]),
+        "crash_start_c": float(crash_start_triplet[3]),
+        "crash_duration_mode": int(crash_duration_triplet[0]),
+        "crash_duration_a": float(crash_duration_triplet[1]),
+        "crash_duration_b": float(crash_duration_triplet[2]),
+        "crash_duration_c": float(crash_duration_triplet[3]),
+        "crash_severity_mode": int(crash_severity_triplet[0]),
+        "crash_severity_a": float(crash_severity_triplet[1]),
+        "crash_severity_b": float(crash_severity_triplet[2]),
+        "crash_severity_c": float(crash_severity_triplet[3]),
+        "prob_layoff_during_crash": float(beliefs["prob_layoff_during_crash"]),
+        "prob_layoff_baseline": float(beliefs["prob_layoff_baseline"]),
+        "layoff_probabilities_are_annual": int(bool(simulation["layoff_probabilities_are_annual"])),
+        "crash_layoff_min_duration": int(simulation["crash_layoff_min_duration_months"]),
+        "baseline_layoff_min_duration": int(simulation["baseline_layoff_min_duration_months"]),
+        "baseline_layoff_max_duration": int(simulation["baseline_layoff_max_duration_months"]),
+    }
+
+
+def _can_use_device_scenario_generation(config, use_cuda_backend):
+    if not use_cuda_backend:
+        return False
+    gpu = config["gpu"]
+    if not gpu["device_scenario_generation"]:
+        return False
+    try:
+        ext = gpu_backend.load_cuda_extension()
+    except gpu_backend.GpuBackendError:
+        return False
+    if not gpu_backend.supports_synthetic_generation(ext):
+        return False
+    beliefs = config["beliefs"]
+    if _distribution_mode_triplet(beliefs["crash_start_month"]) is None:
+        return False
+    if _distribution_mode_triplet(beliefs["crash_duration_months"]) is None:
+        return False
+    if _distribution_mode_triplet(beliefs["crash_severity_drop"]) is None:
+        return False
+    for key in ("prob_crash", "prob_layoff_during_crash", "prob_layoff_baseline"):
+        if not isinstance(beliefs[key], (int, float)):
+            return False
+    return True
+
+
+def _required_horizon_upper_bound(config):
+    beliefs = config["beliefs"]
+    simulation = config["simulation"]
+    prob_crash = beliefs["prob_crash"]
+    if isinstance(prob_crash, (int, float)) and prob_crash <= 0:
+        return simulation["min_horizon_months"]
+
+    crash_start_upper = _distribution_upper_bound(beliefs["crash_start_month"])
+    crash_duration_upper = _distribution_upper_bound(beliefs["crash_duration_months"])
+    if crash_start_upper is None or crash_duration_upper is None:
+        return None
+    max_crash_end = int(np.ceil(crash_start_upper + crash_duration_upper))
+    required = max(max_crash_end + simulation["post_crash_buffer_months"], simulation["min_horizon_months"])
+    return required
+
+
 def _pre_scan_required_horizon(config, chunk_size):
     beliefs = config["beliefs"]
     simulation = config["simulation"]
@@ -731,8 +856,10 @@ def _pre_scan_required_horizon(config, chunk_size):
 
 def _resolve_streaming_horizon(config):
     simulation = config["simulation"]
-    chunk_size = min(simulation["n_sims"], config["gpu"]["scenario_chunk_size"])
-    required_horizon = _pre_scan_required_horizon(config, chunk_size)
+    required_horizon = _required_horizon_upper_bound(config)
+    if required_horizon is None:
+        chunk_size = min(simulation["n_sims"], config["gpu"]["scenario_chunk_size"])
+        required_horizon = _pre_scan_required_horizon(config, chunk_size)
     configured_horizon = simulation["horizon_months"]
     max_horizon = simulation["max_horizon_months"]
 
@@ -1049,19 +1176,11 @@ def _run_streaming_primary_pass(
     transfer_time_ms = 0.0
     t0 = time.perf_counter()
 
-    rng = np.random.default_rng(simulation["seed"])
+    use_device_generation = _can_use_device_scenario_generation(config, use_cuda_backend)
+    rng = np.random.default_rng(simulation["seed"]) if not use_device_generation else None
     sample_ptr = 0
     for start, end in _iter_chunk_ranges(n_sims, chunk_size):
         chunk_n = end - start
-        universe_chunk, chunk_summary = _generate_universe_chunk(config, rng, chunk_n, horizon_months)
-        summary_acc["total"] += chunk_summary["n"]
-        summary_acc["crash_count"] += chunk_summary["crash_count"]
-        summary_acc["crash_start_sum"] += chunk_summary["crash_start_sum"]
-        summary_acc["crash_duration_sum"] += chunk_summary["crash_duration_sum"]
-        summary_acc["crash_severity_sum"] += chunk_summary["crash_severity_sum"]
-        summary_acc["layoff_crash_count"] += chunk_summary["layoff_crash_count"]
-        summary_acc["non_crash_count"] += chunk_summary["non_crash_count"]
-        summary_acc["layoff_non_crash_count"] += chunk_summary["layoff_non_crash_count"]
 
         local_sample = np.empty(0, dtype=np.int64)
         local_sample_count = 0
@@ -1072,6 +1191,58 @@ def _run_streaming_primary_pass(
                 sample_ptr += 1
             local_sample = np.asarray(local_positions, dtype=np.int64)
             local_sample_count = int(local_sample.size)
+
+        if use_device_generation:
+            synthetic_params = _build_synthetic_generation_params(config, horizon_months, start)
+            if synthetic_params is None:
+                raise ValueError(
+                    "gpu.device_scenario_generation is enabled, but beliefs contain unsupported distribution forms."
+                )
+            (
+                tile_sum_final,
+                tile_sum_log,
+                tile_ruin_count,
+                tile_sampled_final,
+                chunk_summary,
+                tile_kernel_ms,
+                tile_transfer_ms,
+            ) = gpu_backend.simulate_fraction_tile_aggregates_synthetic(
+                n_sims=chunk_n,
+                fractions=fractions_to_test,
+                portfolio_config=config["portfolio"],
+                market_config=config["market"],
+                log_utility_wealth_floor=risk["log_utility_wealth_floor"],
+                synthetic_params=synthetic_params,
+                sample_positions=(local_sample if local_sample_count else None),
+                streams=config["gpu"]["streams"],
+            )
+            kernel_time_ms += tile_kernel_ms
+            transfer_time_ms += tile_transfer_ms
+            sum_final += tile_sum_final
+            sum_log += tile_sum_log
+            ruin_count += tile_ruin_count
+            if local_sample_count:
+                sample_matrix[:, sample_ptr - local_sample_count : sample_ptr] = tile_sampled_final
+
+            summary_acc["total"] += chunk_summary["n"]
+            summary_acc["crash_count"] += chunk_summary["crash_count"]
+            summary_acc["crash_start_sum"] += chunk_summary["crash_start_sum"]
+            summary_acc["crash_duration_sum"] += chunk_summary["crash_duration_sum"]
+            summary_acc["crash_severity_sum"] += chunk_summary["crash_severity_sum"]
+            summary_acc["layoff_crash_count"] += chunk_summary["layoff_crash_count"]
+            summary_acc["non_crash_count"] += chunk_summary["non_crash_count"]
+            summary_acc["layoff_non_crash_count"] += chunk_summary["layoff_non_crash_count"]
+            continue
+
+        universe_chunk, chunk_summary = _generate_universe_chunk(config, rng, chunk_n, horizon_months)
+        summary_acc["total"] += chunk_summary["n"]
+        summary_acc["crash_count"] += chunk_summary["crash_count"]
+        summary_acc["crash_start_sum"] += chunk_summary["crash_start_sum"]
+        summary_acc["crash_duration_sum"] += chunk_summary["crash_duration_sum"]
+        summary_acc["crash_severity_sum"] += chunk_summary["crash_severity_sum"]
+        summary_acc["layoff_crash_count"] += chunk_summary["layoff_crash_count"]
+        summary_acc["non_crash_count"] += chunk_summary["non_crash_count"]
+        summary_acc["layoff_non_crash_count"] += chunk_summary["layoff_non_crash_count"]
 
         for tile_start in range(0, n_fractions, fraction_tile_size):
             tile_end = min(tile_start + fraction_tile_size, n_fractions)
@@ -1224,20 +1395,38 @@ def _compute_exact_tail_metrics_via_memmap(
     exact_map = {}
     try:
         values = np.memmap(mmap_path, mode="w+", dtype=np.float64, shape=(subset_n, n_sims))
-        rng = np.random.default_rng(simulation["seed"])
+        use_device_generation = _can_use_device_scenario_generation(config, use_cuda_backend)
+        rng = np.random.default_rng(simulation["seed"]) if not use_device_generation else None
         write_pos = 0
         for start, end in _iter_chunk_ranges(n_sims, chunk_size):
             chunk_n = end - start
-            universe_chunk, _ = _generate_universe_chunk(config, rng, chunk_n, horizon_months)
+            universe_chunk = None
+            if not use_device_generation:
+                universe_chunk, _ = _generate_universe_chunk(config, rng, chunk_n, horizon_months)
             for tile_start in range(0, subset_n, tile_size):
                 tile_end = min(tile_start + tile_size, subset_n)
                 tile_fractions = subset_fractions[tile_start:tile_end]
-                tile_final, _, _ = _simulate_fraction_tile_backend(
-                    universe_chunk,
-                    tile_fractions,
-                    config,
-                    use_cuda_backend,
-                )
+                if use_device_generation:
+                    synthetic_params = _build_synthetic_generation_params(config, horizon_months, start)
+                    if synthetic_params is None:
+                        raise ValueError(
+                            "gpu.device_scenario_generation is enabled, but beliefs contain unsupported distribution forms."
+                        )
+                    tile_final, _, _, _ = gpu_backend.simulate_fraction_tile_synthetic(
+                        n_sims=chunk_n,
+                        fractions=tile_fractions,
+                        portfolio_config=config["portfolio"],
+                        market_config=config["market"],
+                        synthetic_params=synthetic_params,
+                        streams=config["gpu"]["streams"],
+                    )
+                else:
+                    tile_final, _, _ = _simulate_fraction_tile_backend(
+                        universe_chunk,
+                        tile_fractions,
+                        config,
+                        use_cuda_backend,
+                    )
                 values[tile_start:tile_end, write_pos : write_pos + chunk_n] = tile_final
             write_pos += chunk_n
         values.flush()

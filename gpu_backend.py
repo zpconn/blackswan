@@ -181,3 +181,105 @@ def simulate_fraction_tile_aggregates(
     else:
         sampled_final = np.ascontiguousarray(final_net_worth[:, sample_positions_arr], dtype=np.float64)
     return sum_final, sum_log, ruin_count, sampled_final, float(kernel_ms), 0.0
+
+
+def supports_synthetic_generation(ext=None):
+    if ext is None:
+        ext = load_cuda_extension()
+    return hasattr(ext, "simulate_fraction_tile_aggregates_synthetic") and hasattr(
+        ext, "simulate_fraction_tile_synthetic"
+    )
+
+
+def simulate_fraction_tile_aggregates_synthetic(
+    n_sims,
+    fractions,
+    portfolio_config,
+    market_config,
+    log_utility_wealth_floor,
+    synthetic_params,
+    sample_positions=None,
+    streams=1,
+):
+    ext = load_cuda_extension()
+    if not hasattr(ext, "simulate_fraction_tile_aggregates_synthetic"):
+        raise GpuBackendError("CUDA extension does not expose simulate_fraction_tile_aggregates_synthetic.")
+
+    fractions = np.ascontiguousarray(fractions, dtype=np.float64)
+    if sample_positions is None:
+        sample_positions_arr = None
+    else:
+        sample_positions_arr = np.ascontiguousarray(sample_positions, dtype=np.int64)
+
+    try:
+        (
+            sum_final,
+            sum_log,
+            ruin_count,
+            sampled_final,
+            summary,
+            kernel_ms,
+            transfer_ms,
+        ) = ext.simulate_fraction_tile_aggregates_synthetic(
+            int(n_sims),
+            fractions,
+            float(portfolio_config["initial_portfolio"]),
+            float(portfolio_config["initial_basis"]),
+            float(portfolio_config["ltcg_tax_rate"]),
+            float(portfolio_config["monthly_expenses"]),
+            float(portfolio_config["monthly_savings"]),
+            float(market_config["cash_yield_annual"]),
+            float(log_utility_wealth_floor),
+            synthetic_params,
+            sample_positions_arr,
+            int(streams),
+        )
+    except Exception as exc:
+        raise GpuBackendError(f"CUDA synthetic aggregate kernel execution failed: {exc}") from exc
+
+    return (
+        np.asarray(sum_final, dtype=np.float64),
+        np.asarray(sum_log, dtype=np.float64),
+        np.asarray(ruin_count, dtype=np.int64),
+        np.asarray(sampled_final, dtype=np.float64),
+        dict(summary),
+        float(kernel_ms),
+        float(transfer_ms),
+    )
+
+
+def simulate_fraction_tile_synthetic(
+    n_sims,
+    fractions,
+    portfolio_config,
+    market_config,
+    synthetic_params,
+    streams=1,
+):
+    ext = load_cuda_extension()
+    if not hasattr(ext, "simulate_fraction_tile_synthetic"):
+        raise GpuBackendError("CUDA extension does not expose simulate_fraction_tile_synthetic.")
+
+    fractions = np.ascontiguousarray(fractions, dtype=np.float64)
+    try:
+        final_net_worth, ruined, kernel_ms, transfer_ms = ext.simulate_fraction_tile_synthetic(
+            int(n_sims),
+            fractions,
+            float(portfolio_config["initial_portfolio"]),
+            float(portfolio_config["initial_basis"]),
+            float(portfolio_config["ltcg_tax_rate"]),
+            float(portfolio_config["monthly_expenses"]),
+            float(portfolio_config["monthly_savings"]),
+            float(market_config["cash_yield_annual"]),
+            synthetic_params,
+            int(streams),
+        )
+    except Exception as exc:
+        raise GpuBackendError(f"CUDA synthetic full kernel execution failed: {exc}") from exc
+
+    return (
+        np.asarray(final_net_worth, dtype=np.float64),
+        np.asarray(ruined, dtype=bool),
+        float(kernel_ms),
+        float(transfer_ms),
+    )

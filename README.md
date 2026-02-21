@@ -200,6 +200,7 @@ DEFAULT_CONFIG = {
         "fallback_to_cpu_on_error": False,
         "sample_size": 400_000,
         "prefer_cuda_extension": True,
+        "device_scenario_generation": True,
         "refine_top_k": 5,
         "exact_temp_dir": None,
         "min_chunk_size": 32_768,
@@ -224,8 +225,15 @@ Supported distribution specs for beliefs:
 - `risk.shortfall_floor=None` defaults to `portfolio.initial_portfolio`.
 - `decision_grid.num_points=51` with min/max `[0,1]` yields fractions `0%, 2%, ..., 100%`.
 - `parallel_chunk_mode` currently supports only `"fractions"`.
-- `gpu.enabled=True` activates streaming backend dispatch with safe CPU fallback.
+- `gpu.enabled=True` activates streaming backend dispatch.
+- CPU fallback on GPU errors is controlled by `gpu.fallback_to_cpu_on_error`:
+  default is `False` (raise error), set `True` to allow fallback.
 - `gpu.prefer_cuda_extension=True` requires `crash_prep_cuda`; set `False` to use numpy streaming fallback.
+- `gpu.device_scenario_generation=True` synthesizes scenarios directly on GPU when supported.
+- Device-side scenario generation is currently supported when:
+  `beliefs.prob_crash`, `beliefs.prob_layoff_during_crash`, and `beliefs.prob_layoff_baseline`
+  are scalar numbers, and crash timing/distribution fields use scalar/`uniform`/`triangular`.
+  Otherwise the engine automatically uses host-generated scenarios.
 - `gpu.scenario_chunk_size` and `gpu.fraction_tile_size` control memory scaling at high `n_sims`.
 - `gpu.streams` controls true multi-stream CUDA fraction sharding in the aggregate kernel path.
 - `gpu.cvar_mode="streaming_near_exact"` uses bounded-memory tail estimation from sampled scenarios.
@@ -318,6 +326,21 @@ Top-level return keys from `run_monte_carlo_optimization(...)`:
 - `fraction_tasks`
 - `fallback_reason`
 
+When `backend="cuda"`, `execution` also includes CUDA/runtime telemetry:
+
+- `gpu_name`
+- `driver_version`
+- `cuda_runtime_version`
+- `device_memory_total_mb`
+- `device_memory_free_mb`
+- `chunk_size_used`
+- `fraction_tile_used`
+- `precision_mode`
+- `cvar_mode`
+- `kernel_time_ms`
+- `transfer_time_ms`
+- `reduction_time_ms`
+
 `objective_comparison` always contains all three objective selections, even if one mode is primary.
 
 ## Troubleshooting
@@ -347,6 +370,8 @@ Check:
 - CUDA toolkit/build deps are present in WSL2
 - `gpu.prefer_cuda_extension` is set as intended
 - `execution.fallback_reason` for precise fallback details
+- `gpu.fallback_to_cpu_on_error` behavior:
+  with `False`, GPU errors are raised; with `True`, execution may fall back.
 
 ### Exact two-pass mode is slow or disk-heavy
 
