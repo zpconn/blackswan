@@ -2,8 +2,12 @@ import concurrent.futures
 from copy import deepcopy
 import multiprocessing
 import os
+import tempfile
+import time
 
 import numpy as np
+
+import gpu_backend
 
 
 DEFAULT_CONFIG = {
@@ -20,7 +24,7 @@ DEFAULT_CONFIG = {
         "market_yield_annual": 0.08,
     },
     "simulation": {
-        "n_sims": 500_000,
+        "n_sims": 10_000_000,
         "seed": 42,
         "min_horizon_months": 72,
         "horizon_months": None,
@@ -30,7 +34,7 @@ DEFAULT_CONFIG = {
         "crash_layoff_min_duration_months": 24,
         "baseline_layoff_min_duration_months": 1,
         "baseline_layoff_max_duration_months": 12,
-        "parallel_enabled": True,
+        "parallel_enabled": False,
         "parallel_workers": None,
         "parallel_start_method": None,
         "parallel_chunk_mode": "fractions",
@@ -59,11 +63,31 @@ DEFAULT_CONFIG = {
         "prob_layoff_during_crash": 0.50,
         "prob_layoff_baseline": 0.15,
     },
+    "gpu": {
+        "enabled": True,
+        "device_id": 0,
+        "scenario_chunk_size": 262_144,
+        "fraction_tile_size": 64,
+        "precision_mode": "mixed",
+        "cvar_mode": "streaming_near_exact",
+        "cvar_refine_pass": True,
+        "streams": 2,
+        "max_vram_utilization": 0.85,
+        "fallback_to_cpu_on_error": False,
+        "sample_size": 400_000,
+        "prefer_cuda_extension": True,
+        "refine_top_k": 5,
+        "exact_temp_dir": None,
+        "min_chunk_size": 32_768,
+        "oom_backoff_factor": 0.5,
+    },
 }
 
 SUPPORTED_DISTRIBUTIONS = {"beta", "triangular", "uniform", "lognormal"}
 SUPPORTED_OBJECTIVES = {"cvar_shortfall", "expected_log_utility", "consensus"}
 SUPPORTED_PARALLEL_CHUNK_MODES = {"fractions"}
+SUPPORTED_GPU_PRECISION_MODES = {"mixed", "fp64_strict", "fp32_fast"}
+SUPPORTED_GPU_CVAR_MODES = {"streaming_near_exact", "exact_two_pass"}
 
 _PARALLEL_UNIVERSE = None
 _PARALLEL_CONFIG = None
@@ -132,7 +156,7 @@ def _validate_distribution_spec(name, spec):
 
 
 def validate_config(config):
-    for key in ("portfolio", "market", "simulation", "decision_grid", "risk", "beliefs"):
+    for key in ("portfolio", "market", "simulation", "decision_grid", "risk", "beliefs", "gpu"):
         if key not in config:
             raise ValueError(f"Missing top-level config section '{key}'.")
 
@@ -142,6 +166,7 @@ def validate_config(config):
     decision_grid = config["decision_grid"]
     risk = config["risk"]
     beliefs = config["beliefs"]
+    gpu = config["gpu"]
 
     if portfolio["initial_portfolio"] <= 0:
         raise ValueError("portfolio.initial_portfolio must be > 0.")
@@ -219,6 +244,41 @@ def validate_config(config):
         raise ValueError("risk.log_utility_wealth_floor must be > 0.")
     if not (0.0 <= risk["consensus_tolerance"] <= 1.0):
         raise ValueError("risk.consensus_tolerance must be in [0, 1].")
+
+    if not isinstance(gpu["enabled"], bool):
+        raise ValueError("gpu.enabled must be a bool.")
+    if gpu["device_id"] < 0:
+        raise ValueError("gpu.device_id must be >= 0.")
+    if gpu["scenario_chunk_size"] <= 0:
+        raise ValueError("gpu.scenario_chunk_size must be > 0.")
+    if gpu["fraction_tile_size"] <= 0:
+        raise ValueError("gpu.fraction_tile_size must be > 0.")
+    if gpu["precision_mode"] not in SUPPORTED_GPU_PRECISION_MODES:
+        allowed = ", ".join(sorted(SUPPORTED_GPU_PRECISION_MODES))
+        raise ValueError(f"gpu.precision_mode must be one of: {allowed}")
+    if gpu["cvar_mode"] not in SUPPORTED_GPU_CVAR_MODES:
+        allowed = ", ".join(sorted(SUPPORTED_GPU_CVAR_MODES))
+        raise ValueError(f"gpu.cvar_mode must be one of: {allowed}")
+    if not isinstance(gpu["cvar_refine_pass"], bool):
+        raise ValueError("gpu.cvar_refine_pass must be a bool.")
+    if gpu["streams"] <= 0:
+        raise ValueError("gpu.streams must be > 0.")
+    if not (0.1 <= gpu["max_vram_utilization"] <= 0.98):
+        raise ValueError("gpu.max_vram_utilization must be in [0.1, 0.98].")
+    if not isinstance(gpu["fallback_to_cpu_on_error"], bool):
+        raise ValueError("gpu.fallback_to_cpu_on_error must be a bool.")
+    if gpu["sample_size"] <= 0:
+        raise ValueError("gpu.sample_size must be > 0.")
+    if not isinstance(gpu["prefer_cuda_extension"], bool):
+        raise ValueError("gpu.prefer_cuda_extension must be a bool.")
+    if gpu["refine_top_k"] <= 0:
+        raise ValueError("gpu.refine_top_k must be > 0.")
+    if gpu["exact_temp_dir"] is not None and not isinstance(gpu["exact_temp_dir"], str):
+        raise ValueError("gpu.exact_temp_dir must be a string path or None.")
+    if gpu["min_chunk_size"] <= 0:
+        raise ValueError("gpu.min_chunk_size must be > 0.")
+    if not (0.1 <= gpu["oom_backoff_factor"] < 1.0):
+        raise ValueError("gpu.oom_backoff_factor must be in [0.1, 1.0).")
 
     required_belief_keys = (
         "prob_crash",
@@ -622,6 +682,762 @@ def _score_strategy(final_net_worth, ruined, config):
     }
 
 
+def _iter_chunk_ranges(total, chunk_size):
+    start = 0
+    while start < total:
+        end = min(total, start + chunk_size)
+        yield start, end
+        start = end
+
+
+def _build_sampling_indices(total, sample_size, seed):
+    if sample_size >= total:
+        return np.arange(total, dtype=np.int64)
+
+    rng = np.random.default_rng(seed)
+    selected = set()
+    while len(selected) < sample_size:
+        remaining = sample_size - len(selected)
+        draws = rng.integers(0, total, size=remaining * 2, dtype=np.int64)
+        selected.update(int(x) for x in draws)
+    sampled = np.fromiter(selected, dtype=np.int64, count=len(selected))
+    if sampled.size > sample_size:
+        keep = rng.choice(sampled.size, size=sample_size, replace=False)
+        sampled = sampled[keep]
+    sampled.sort()
+    return sampled
+
+
+def _pre_scan_required_horizon(config, chunk_size):
+    beliefs = config["beliefs"]
+    simulation = config["simulation"]
+    n_sims = simulation["n_sims"]
+
+    rng = np.random.default_rng(simulation["seed"])
+    max_crash_end = simulation["min_horizon_months"]
+    for start, end in _iter_chunk_ranges(n_sims, chunk_size):
+        size = end - start
+        prob_crash = _sample_probability(beliefs["prob_crash"], size, rng)
+        crash_start = _sample_positive_int(beliefs["crash_start_month"], size, rng, minimum=1)
+        crash_duration = _sample_positive_int(beliefs["crash_duration_months"], size, rng, minimum=1)
+        is_crash = rng.random(size) < prob_crash
+        if np.any(is_crash):
+            local_max = int(np.max(crash_start[is_crash] + crash_duration[is_crash]))
+            if local_max > max_crash_end:
+                max_crash_end = local_max
+
+    return max(max_crash_end + simulation["post_crash_buffer_months"], simulation["min_horizon_months"])
+
+
+def _resolve_streaming_horizon(config):
+    simulation = config["simulation"]
+    chunk_size = min(simulation["n_sims"], config["gpu"]["scenario_chunk_size"])
+    required_horizon = _pre_scan_required_horizon(config, chunk_size)
+    configured_horizon = simulation["horizon_months"]
+    max_horizon = simulation["max_horizon_months"]
+
+    if configured_horizon is not None:
+        if configured_horizon < required_horizon:
+            raise ValueError(
+                "simulation.horizon_months is shorter than sampled crash windows "
+                f"(required at least {required_horizon}, got {configured_horizon})."
+            )
+        return configured_horizon
+
+    if required_horizon > max_horizon:
+        raise ValueError(
+            "Sampled crash windows require a horizon larger than "
+            f"simulation.max_horizon_months ({required_horizon} > {max_horizon}). "
+            "Adjust beliefs or increase max_horizon_months."
+        )
+    return required_horizon
+
+
+def _generate_universe_chunk(config, rng, size, horizon_months):
+    beliefs = config["beliefs"]
+    market = config["market"]
+    simulation = config["simulation"]
+
+    prob_crash = _sample_probability(beliefs["prob_crash"], size, rng)
+    crash_start = _sample_positive_int(beliefs["crash_start_month"], size, rng, minimum=1)
+    crash_duration = _sample_positive_int(beliefs["crash_duration_months"], size, rng, minimum=1)
+    crash_severity = np.clip(
+        _sample_distribution(beliefs["crash_severity_drop"], size, rng),
+        1e-4,
+        0.95,
+    )
+    prob_layoff_during_crash = _sample_probability(beliefs["prob_layoff_during_crash"], size, rng)
+    prob_layoff_baseline = _sample_probability(beliefs["prob_layoff_baseline"], size, rng)
+
+    is_crash = rng.random(size) < prob_crash
+    crash_end = crash_start + crash_duration
+    if np.any(is_crash) and int(np.max(crash_end[is_crash])) > horizon_months:
+        raise ValueError(
+            "Resolved horizon is shorter than sampled crash windows. "
+            "Provide simulation.horizon_months explicitly or increase max_horizon_months."
+        )
+
+    down_months = np.maximum(1, crash_duration // 2)
+    up_months = np.maximum(1, crash_duration - down_months)
+    down_end = crash_start + down_months
+
+    sigma = market["volatility_annual"] / np.sqrt(12.0)
+    monthly_market_drift = market["market_yield_annual"] / 12.0
+    monthly_returns = rng.normal(0.0, sigma, size=(size, horizon_months)).astype(np.float32)
+
+    if np.any(is_crash):
+        mu_down = (1.0 - crash_severity) ** (1.0 / down_months) - 1.0
+        mu_up = (1.0 / (1.0 - crash_severity)) ** (1.0 / up_months) - 1.0
+        for month in range(1, horizon_months + 1):
+            drift = np.full(size, monthly_market_drift, dtype=np.float32)
+            mask_down = is_crash & (month >= crash_start) & (month < down_end)
+            if np.any(mask_down):
+                drift[mask_down] = mu_down[mask_down].astype(np.float32)
+            mask_up = is_crash & (month >= down_end) & (month < crash_end)
+            if np.any(mask_up):
+                drift[mask_up] = mu_up[mask_up].astype(np.float32)
+            monthly_returns[:, month - 1] += drift
+    else:
+        monthly_returns += np.float32(monthly_market_drift)
+    np.clip(monthly_returns, -0.95, 1.5, out=monthly_returns)
+
+    layoff_probabilities_are_annual = simulation["layoff_probabilities_are_annual"]
+    crash_layoff_min_duration = simulation["crash_layoff_min_duration_months"]
+    baseline_layoff_min_duration = simulation["baseline_layoff_min_duration_months"]
+    baseline_layoff_max_duration = simulation["baseline_layoff_max_duration_months"]
+
+    layoff_start = np.full(size, horizon_months + 1, dtype=np.int32)
+    layoff_end = np.full(size, horizon_months + 1, dtype=np.int32)
+    will_lose_job = np.zeros(size, dtype=bool)
+
+    crash_idx = np.flatnonzero(is_crash)
+    if crash_idx.size > 0:
+        crash_layoff_event_prob = prob_layoff_during_crash[crash_idx]
+        if layoff_probabilities_are_annual:
+            crash_years = (crash_end[crash_idx] - crash_start[crash_idx]) / 12.0
+            crash_layoff_event_prob = 1.0 - np.power(1.0 - crash_layoff_event_prob, crash_years)
+            crash_layoff_event_prob = np.clip(crash_layoff_event_prob, 0.0, 1.0)
+
+        crash_layoff = rng.random(crash_idx.size) < crash_layoff_event_prob
+        crash_layoff_idx = crash_idx[crash_layoff]
+        if crash_layoff_idx.size > 0:
+            latest_start = crash_end[crash_layoff_idx] - crash_layoff_min_duration
+            eligible = latest_start >= crash_start[crash_layoff_idx]
+            eligible_idx = crash_layoff_idx[eligible]
+
+            if eligible_idx.size > 0:
+                eligible_latest_start = latest_start[eligible]
+                start_window = eligible_latest_start - crash_start[eligible_idx] + 1
+                offsets = np.floor(rng.random(eligible_idx.size) * start_window).astype(np.int32)
+                starts = crash_start[eligible_idx] + offsets
+                max_duration = crash_end[eligible_idx] - starts
+                duration_span = max_duration - crash_layoff_min_duration + 1
+                duration_offsets = np.floor(rng.random(eligible_idx.size) * duration_span).astype(np.int32)
+                durations = crash_layoff_min_duration + duration_offsets
+                will_lose_job[eligible_idx] = True
+                layoff_start[eligible_idx] = starts
+                layoff_end[eligible_idx] = starts + durations
+
+    non_crash_idx = np.flatnonzero(~is_crash)
+    if non_crash_idx.size > 0:
+        baseline_layoff_event_prob = prob_layoff_baseline[non_crash_idx]
+        if layoff_probabilities_are_annual:
+            horizon_years = horizon_months / 12.0
+            baseline_layoff_event_prob = 1.0 - np.power(1.0 - baseline_layoff_event_prob, horizon_years)
+            baseline_layoff_event_prob = np.clip(baseline_layoff_event_prob, 0.0, 1.0)
+
+        baseline_layoff = rng.random(non_crash_idx.size) < baseline_layoff_event_prob
+        baseline_layoff_idx = non_crash_idx[baseline_layoff]
+        if baseline_layoff_idx.size > 0:
+            latest_start = horizon_months - baseline_layoff_min_duration + 1
+            if latest_start >= 1:
+                starts = rng.integers(1, latest_start + 1, size=baseline_layoff_idx.size, dtype=np.int32)
+                max_duration = np.minimum(
+                    baseline_layoff_max_duration,
+                    horizon_months - starts + 1,
+                )
+                duration_span = max_duration - baseline_layoff_min_duration + 1
+                duration_offsets = np.floor(
+                    rng.random(baseline_layoff_idx.size) * duration_span
+                ).astype(np.int32)
+                durations = baseline_layoff_min_duration + duration_offsets
+                will_lose_job[baseline_layoff_idx] = True
+                layoff_start[baseline_layoff_idx] = starts
+                layoff_end[baseline_layoff_idx] = starts + durations
+
+    months = np.arange(1, horizon_months + 1, dtype=np.int32)[None, :]
+    unemployment_matrix = will_lose_job[:, None] & (months >= layoff_start[:, None]) & (
+        months < layoff_end[:, None]
+    )
+
+    chunk_summary = {
+        "n": size,
+        "crash_count": int(np.sum(is_crash)),
+        "crash_start_sum": float(np.sum(crash_start[is_crash])) if np.any(is_crash) else 0.0,
+        "crash_duration_sum": float(np.sum(crash_duration[is_crash])) if np.any(is_crash) else 0.0,
+        "crash_severity_sum": float(np.sum(crash_severity[is_crash])) if np.any(is_crash) else 0.0,
+        "layoff_crash_count": int(np.sum(will_lose_job[is_crash])) if np.any(is_crash) else 0,
+        "non_crash_count": int(np.sum(~is_crash)),
+        "layoff_non_crash_count": int(np.sum(will_lose_job[~is_crash])) if np.any(~is_crash) else 0,
+    }
+
+    universe_chunk = {
+        "n_sims": size,
+        "horizon_months": horizon_months,
+        "monthly_returns": monthly_returns,
+        "unemployment_matrix": unemployment_matrix,
+    }
+    return universe_chunk, chunk_summary
+
+
+def _finalize_streaming_summary(summary_acc, horizon_months):
+    total = summary_acc["total"]
+    crash_count = summary_acc["crash_count"]
+    non_crash_count = summary_acc["non_crash_count"]
+    return {
+        "horizon_months": int(horizon_months),
+        "realized_crash_rate": float(crash_count / total),
+        "mean_crash_start_if_crash": (
+            float(summary_acc["crash_start_sum"] / crash_count) if crash_count else None
+        ),
+        "mean_crash_duration_if_crash": (
+            float(summary_acc["crash_duration_sum"] / crash_count) if crash_count else None
+        ),
+        "mean_crash_severity_if_crash": (
+            float(summary_acc["crash_severity_sum"] / crash_count) if crash_count else None
+        ),
+        "layoff_rate_if_crash": float(summary_acc["layoff_crash_count"] / crash_count) if crash_count else 0.0,
+        "layoff_rate_if_no_crash": (
+            float(summary_acc["layoff_non_crash_count"] / non_crash_count) if non_crash_count else 0.0
+        ),
+    }
+
+
+def _is_oom_error(exc):
+    text = str(exc).lower()
+    return (
+        "out of memory" in text
+        or "cudaerrormemoryallocation" in text
+        or "memory allocation" in text
+        or "cuda malloc" in text
+    )
+
+
+def _estimate_cuda_working_set_bytes(horizon_months, chunk_size, fraction_tile_size, expected_sample_count):
+    # Approximate bytes used by the aggregate CUDA path for one tile evaluation.
+    input_returns = chunk_size * horizon_months * 4
+    input_unemployment = chunk_size * horizon_months * 1
+    sample_map = chunk_size * 4 if expected_sample_count > 0 else 0
+    aggregate_sums = fraction_tile_size * (8 + 8 + 8)  # sum_final, sum_log, ruin_count
+    sampled_values = fraction_tile_size * expected_sample_count * 8
+    base = input_returns + input_unemployment + sample_map + aggregate_sums + sampled_values
+    return int(base * 1.40)  # headroom for runtime/temp allocations
+
+
+def _autotune_streaming_geometry(config, n_fractions, horizon_months, gpu_meta, use_cuda_backend):
+    simulation = config["simulation"]
+    gpu = config["gpu"]
+    n_sims = simulation["n_sims"]
+    sample_size = 0
+    if gpu["cvar_mode"] == "streaming_near_exact":
+        sample_size = min(gpu["sample_size"], n_sims)
+    sample_ratio = (sample_size / n_sims) if sample_size > 0 else 0.0
+
+    chunk_size = min(n_sims, gpu["scenario_chunk_size"])
+    fraction_tile_size = min(n_fractions, gpu["fraction_tile_size"])
+    min_chunk_size = min(n_sims, gpu["min_chunk_size"])
+
+    note = None
+    if not use_cuda_backend:
+        return chunk_size, fraction_tile_size, note
+
+    free_mb = gpu_meta.get("device_memory_free_mb")
+    total_mb = gpu_meta.get("device_memory_total_mb")
+    base_mb = free_mb if free_mb is not None else total_mb
+    if base_mb is None:
+        return chunk_size, fraction_tile_size, note
+
+    budget_bytes = int(base_mb * 1024 * 1024 * gpu["max_vram_utilization"])
+    while True:
+        expected_sample_count = min(chunk_size, int(np.ceil(chunk_size * sample_ratio))) if sample_ratio > 0 else 0
+        if (
+            _estimate_cuda_working_set_bytes(
+                horizon_months,
+                chunk_size,
+                fraction_tile_size,
+                expected_sample_count,
+            )
+            <= budget_bytes
+        ):
+            break
+        prev_chunk = chunk_size
+        prev_tile = fraction_tile_size
+        if fraction_tile_size > 1 and (chunk_size <= min_chunk_size or fraction_tile_size > 4):
+            fraction_tile_size = max(1, int(np.ceil(fraction_tile_size / 2)))
+        elif chunk_size > min_chunk_size:
+            chunk_size = max(min_chunk_size, int(np.floor(chunk_size * gpu["oom_backoff_factor"])))
+        if prev_chunk == chunk_size and prev_tile == fraction_tile_size:
+            break
+
+    if chunk_size != min(n_sims, gpu["scenario_chunk_size"]) or fraction_tile_size != min(
+        n_fractions, gpu["fraction_tile_size"]
+    ):
+        note = (
+            "Auto-tuned streaming geometry from "
+            f"(chunk={min(n_sims, gpu['scenario_chunk_size'])}, tile={min(n_fractions, gpu['fraction_tile_size'])}) "
+            f"to (chunk={chunk_size}, tile={fraction_tile_size}) based on GPU memory budget."
+        )
+    return chunk_size, fraction_tile_size, note
+
+
+def _simulate_fraction_tile_backend(universe_chunk, tile_fractions, config, use_cuda_backend):
+    if use_cuda_backend:
+        return gpu_backend.simulate_fraction_tile(
+            universe_chunk["monthly_returns"],
+            universe_chunk["unemployment_matrix"],
+            tile_fractions,
+            config["portfolio"],
+            config["market"],
+        )
+
+    chunk_n = universe_chunk["n_sims"]
+    tile_n = len(tile_fractions)
+    tile_final = np.empty((tile_n, chunk_n), dtype=np.float64)
+    tile_ruined = np.empty((tile_n, chunk_n), dtype=bool)
+    for idx, fraction in enumerate(tile_fractions):
+        final_net_worth, ruined = _simulate_strategy_fraction(fraction, universe_chunk, config)
+        tile_final[idx] = final_net_worth
+        tile_ruined[idx] = ruined
+    return tile_final, tile_ruined, 0.0
+
+
+def _run_streaming_primary_pass(
+    fractions_to_test,
+    config,
+    horizon_months,
+    chunk_size,
+    fraction_tile_size,
+    use_cuda_backend,
+    sample_indices,
+):
+    simulation = config["simulation"]
+    risk = config["risk"]
+    n_sims = simulation["n_sims"]
+    n_fractions = len(fractions_to_test)
+    sample_size = 0 if sample_indices is None else int(sample_indices.size)
+
+    sample_matrix = None
+    if sample_size:
+        sample_matrix = np.empty((n_fractions, sample_size), dtype=np.float64)
+
+    sum_final = np.zeros(n_fractions, dtype=np.float64)
+    sum_log = np.zeros(n_fractions, dtype=np.float64)
+    ruin_count = np.zeros(n_fractions, dtype=np.int64)
+
+    summary_acc = {
+        "total": 0,
+        "crash_count": 0,
+        "crash_start_sum": 0.0,
+        "crash_duration_sum": 0.0,
+        "crash_severity_sum": 0.0,
+        "layoff_crash_count": 0,
+        "non_crash_count": 0,
+        "layoff_non_crash_count": 0,
+    }
+
+    kernel_time_ms = 0.0
+    transfer_time_ms = 0.0
+    t0 = time.perf_counter()
+
+    rng = np.random.default_rng(simulation["seed"])
+    sample_ptr = 0
+    for start, end in _iter_chunk_ranges(n_sims, chunk_size):
+        chunk_n = end - start
+        universe_chunk, chunk_summary = _generate_universe_chunk(config, rng, chunk_n, horizon_months)
+        summary_acc["total"] += chunk_summary["n"]
+        summary_acc["crash_count"] += chunk_summary["crash_count"]
+        summary_acc["crash_start_sum"] += chunk_summary["crash_start_sum"]
+        summary_acc["crash_duration_sum"] += chunk_summary["crash_duration_sum"]
+        summary_acc["crash_severity_sum"] += chunk_summary["crash_severity_sum"]
+        summary_acc["layoff_crash_count"] += chunk_summary["layoff_crash_count"]
+        summary_acc["non_crash_count"] += chunk_summary["non_crash_count"]
+        summary_acc["layoff_non_crash_count"] += chunk_summary["layoff_non_crash_count"]
+
+        local_sample = np.empty(0, dtype=np.int64)
+        local_sample_count = 0
+        if sample_size:
+            local_positions = []
+            while sample_ptr < sample_size and sample_indices[sample_ptr] < end:
+                local_positions.append(int(sample_indices[sample_ptr] - start))
+                sample_ptr += 1
+            local_sample = np.asarray(local_positions, dtype=np.int64)
+            local_sample_count = int(local_sample.size)
+
+        for tile_start in range(0, n_fractions, fraction_tile_size):
+            tile_end = min(tile_start + fraction_tile_size, n_fractions)
+            tile_fractions = fractions_to_test[tile_start:tile_end]
+            if use_cuda_backend:
+                (
+                    tile_sum_final,
+                    tile_sum_log,
+                    tile_ruin_count,
+                    tile_sampled_final,
+                    tile_kernel_ms,
+                    tile_transfer_ms,
+                ) = gpu_backend.simulate_fraction_tile_aggregates(
+                    universe_chunk["monthly_returns"],
+                    universe_chunk["unemployment_matrix"],
+                    tile_fractions,
+                    config["portfolio"],
+                    config["market"],
+                    risk["log_utility_wealth_floor"],
+                    sample_positions=(local_sample if local_sample_count else None),
+                    streams=config["gpu"]["streams"],
+                )
+                kernel_time_ms += tile_kernel_ms
+                transfer_time_ms += tile_transfer_ms
+                sum_final[tile_start:tile_end] += tile_sum_final
+                sum_log[tile_start:tile_end] += tile_sum_log
+                ruin_count[tile_start:tile_end] += tile_ruin_count
+                if local_sample_count:
+                    sample_matrix[tile_start:tile_end, sample_ptr - local_sample_count : sample_ptr] = tile_sampled_final
+            else:
+                tile_final, tile_ruined, tile_kernel_ms = _simulate_fraction_tile_backend(
+                    universe_chunk,
+                    tile_fractions,
+                    config,
+                    use_cuda_backend,
+                )
+                kernel_time_ms += tile_kernel_ms
+                sum_final[tile_start:tile_end] += np.sum(tile_final, axis=1)
+                sum_log[tile_start:tile_end] += np.sum(
+                    np.log(np.maximum(tile_final, risk["log_utility_wealth_floor"])),
+                    axis=1,
+                )
+                ruin_count[tile_start:tile_end] += np.sum(tile_ruined, axis=1)
+
+                if local_sample_count:
+                    t_transfer = time.perf_counter()
+                    sample_matrix[tile_start:tile_end, sample_ptr - local_sample_count : sample_ptr] = tile_final[
+                        :,
+                        local_sample,
+                    ]
+                    transfer_time_ms += (time.perf_counter() - t_transfer) * 1000.0
+
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    reduction_time_ms = max(0.0, total_ms - kernel_time_ms - transfer_time_ms)
+    return {
+        "sum_final": sum_final,
+        "sum_log": sum_log,
+        "ruin_count": ruin_count,
+        "sample_matrix": sample_matrix,
+        "summary": _finalize_streaming_summary(summary_acc, horizon_months),
+        "kernel_time_ms": kernel_time_ms,
+        "transfer_time_ms": transfer_time_ms,
+        "reduction_time_ms": reduction_time_ms,
+    }
+
+
+def _build_diagnostics_from_metric_arrays(
+    config,
+    fractions,
+    mean_final,
+    log_utility_score,
+    ruin_probability,
+    p10_final_net_worth,
+    cvar_shortfall,
+):
+    risk = config["risk"]
+    diagnostics = []
+    for idx, fraction in enumerate(fractions):
+        cvar_objective_score = float(mean_final[idx] - risk["lambda"] * cvar_shortfall[idx])
+        objective_mode = risk["objective_mode"]
+        if objective_mode == "cvar_shortfall":
+            display_score = cvar_objective_score
+        elif objective_mode == "expected_log_utility":
+            display_score = float(log_utility_score[idx])
+        else:
+            display_score = 0.0
+        diagnostics.append(
+            {
+                "expected_final_net_worth": float(mean_final[idx]),
+                "p10_final_net_worth": float(p10_final_net_worth[idx]),
+                "cvar_shortfall": float(cvar_shortfall[idx]),
+                "ruin_probability": float(ruin_probability[idx]),
+                "cvar_objective_score": cvar_objective_score,
+                "log_utility_score": float(log_utility_score[idx]),
+                "score": float(display_score),
+                "fraction_sold_today": float(fraction),
+            }
+        )
+    return diagnostics
+
+
+def _derive_tail_metrics_from_samples(config, sample_matrix):
+    if sample_matrix is None:
+        raise ValueError("sample_matrix is required for streaming tail estimation.")
+    risk = config["risk"]
+    portfolio = config["portfolio"]
+    shortfall_floor = risk["shortfall_floor"]
+    if shortfall_floor is None:
+        shortfall_floor = portfolio["initial_portfolio"]
+
+    n_fractions = sample_matrix.shape[0]
+    p10 = np.zeros(n_fractions, dtype=np.float64)
+    cvar = np.zeros(n_fractions, dtype=np.float64)
+    for idx in range(n_fractions):
+        sampled_final = sample_matrix[idx]
+        p10[idx] = float(np.percentile(sampled_final, 10))
+        sampled_shortfall = np.maximum(0.0, shortfall_floor - sampled_final)
+        cvar[idx] = _compute_cvar(sampled_shortfall, risk["alpha"])
+    return p10, cvar
+
+
+def _compute_exact_tail_metrics_via_memmap(
+    config,
+    fractions_to_test,
+    fraction_indices,
+    horizon_months,
+    chunk_size,
+    fraction_tile_size,
+    use_cuda_backend,
+):
+    if not fraction_indices:
+        return {}
+
+    simulation = config["simulation"]
+    risk = config["risk"]
+    portfolio = config["portfolio"]
+    gpu = config["gpu"]
+    n_sims = simulation["n_sims"]
+    shortfall_floor = risk["shortfall_floor"]
+    if shortfall_floor is None:
+        shortfall_floor = portfolio["initial_portfolio"]
+
+    subset_fractions = np.asarray([fractions_to_test[idx] for idx in fraction_indices], dtype=np.float64)
+    subset_n = subset_fractions.size
+    tile_size = min(fraction_tile_size, subset_n)
+    temp_dir = gpu["exact_temp_dir"] or tempfile.gettempdir()
+
+    fd, mmap_path = tempfile.mkstemp(prefix="cpo_exact_tail_", suffix=".dat", dir=temp_dir)
+    os.close(fd)
+    exact_map = {}
+    try:
+        values = np.memmap(mmap_path, mode="w+", dtype=np.float64, shape=(subset_n, n_sims))
+        rng = np.random.default_rng(simulation["seed"])
+        write_pos = 0
+        for start, end in _iter_chunk_ranges(n_sims, chunk_size):
+            chunk_n = end - start
+            universe_chunk, _ = _generate_universe_chunk(config, rng, chunk_n, horizon_months)
+            for tile_start in range(0, subset_n, tile_size):
+                tile_end = min(tile_start + tile_size, subset_n)
+                tile_fractions = subset_fractions[tile_start:tile_end]
+                tile_final, _, _ = _simulate_fraction_tile_backend(
+                    universe_chunk,
+                    tile_fractions,
+                    config,
+                    use_cuda_backend,
+                )
+                values[tile_start:tile_end, write_pos : write_pos + chunk_n] = tile_final
+            write_pos += chunk_n
+        values.flush()
+
+        for local_idx, global_idx in enumerate(fraction_indices):
+            row = np.asarray(values[local_idx], dtype=np.float64)
+            p10 = float(np.percentile(row, 10))
+            shortfall = np.maximum(0.0, shortfall_floor - row)
+            cvar = float(_compute_cvar(shortfall, risk["alpha"]))
+            exact_map[int(global_idx)] = (p10, cvar)
+
+        del values
+    finally:
+        try:
+            os.remove(mmap_path)
+        except OSError:
+            pass
+
+    return exact_map
+
+
+def _apply_exact_tail_metrics(diagnostics, exact_tail_metrics, config):
+    risk = config["risk"]
+    for idx, metrics in enumerate(diagnostics):
+        if idx not in exact_tail_metrics:
+            continue
+        p10, cvar = exact_tail_metrics[idx]
+        metrics["p10_final_net_worth"] = float(p10)
+        metrics["cvar_shortfall"] = float(cvar)
+        metrics["cvar_objective_score"] = float(
+            metrics["expected_final_net_worth"] - risk["lambda"] * metrics["cvar_shortfall"]
+        )
+        if risk["objective_mode"] == "cvar_shortfall":
+            metrics["score"] = metrics["cvar_objective_score"]
+
+
+def _select_refine_candidate_indices(diagnostics, max_ruin_probability, refine_top_k):
+    eligible = [idx for idx, item in enumerate(diagnostics) if item["ruin_probability"] <= max_ruin_probability]
+    if not eligible:
+        return []
+    top_k = min(refine_top_k, len(eligible))
+    by_cvar = sorted(eligible, key=lambda idx: diagnostics[idx]["cvar_objective_score"], reverse=True)[:top_k]
+    by_log = sorted(eligible, key=lambda idx: diagnostics[idx]["log_utility_score"], reverse=True)[:top_k]
+    merged = sorted(set(by_cvar + by_log))
+    return merged
+
+
+def _collect_fraction_metrics_streaming(fractions_to_test, config):
+    simulation = config["simulation"]
+    gpu = config["gpu"]
+    n_sims = simulation["n_sims"]
+    n_fractions = len(fractions_to_test)
+
+    use_cuda_backend = bool(gpu["prefer_cuda_extension"])
+    fallback_reasons = []
+    if use_cuda_backend:
+        try:
+            gpu_backend.load_cuda_extension()
+        except gpu_backend.GpuBackendError as exc:
+            use_cuda_backend = False
+            fallback_reasons.append(str(exc))
+    else:
+        fallback_reasons.append("Using numpy_streaming backend because gpu.prefer_cuda_extension is False.")
+
+    gpu_meta = gpu_backend.query_device_metadata(gpu["device_id"])
+    horizon_months = _resolve_streaming_horizon(config)
+    chunk_size, fraction_tile_size, tune_note = _autotune_streaming_geometry(
+        config,
+        n_fractions,
+        horizon_months,
+        gpu_meta,
+        use_cuda_backend,
+    )
+    if tune_note is not None:
+        fallback_reasons.append(tune_note)
+
+    min_chunk = min(n_sims, gpu["min_chunk_size"])
+    kernel_time_ms = 0.0
+    transfer_time_ms = 0.0
+    reduction_time_ms = 0.0
+    summary = None
+
+    while True:
+        try:
+            sample_indices = None
+            if gpu["cvar_mode"] == "streaming_near_exact":
+                sample_size = min(gpu["sample_size"], n_sims)
+                sample_indices = _build_sampling_indices(
+                    n_sims,
+                    sample_size,
+                    simulation["seed"] + 10_003,
+                )
+
+            primary = _run_streaming_primary_pass(
+                fractions_to_test,
+                config,
+                horizon_months,
+                chunk_size,
+                fraction_tile_size,
+                use_cuda_backend,
+                sample_indices,
+            )
+            kernel_time_ms = primary["kernel_time_ms"]
+            transfer_time_ms = primary["transfer_time_ms"]
+            reduction_time_ms = primary["reduction_time_ms"]
+            summary = primary["summary"]
+
+            mean_final = primary["sum_final"] / n_sims
+            log_score = primary["sum_log"] / n_sims
+            ruin_probability = primary["ruin_count"] / n_sims
+
+            if gpu["cvar_mode"] == "streaming_near_exact":
+                p10, cvar = _derive_tail_metrics_from_samples(config, primary["sample_matrix"])
+            else:
+                p10 = np.zeros(n_fractions, dtype=np.float64)
+                cvar = np.zeros(n_fractions, dtype=np.float64)
+
+            diagnostics = _build_diagnostics_from_metric_arrays(
+                config,
+                fractions_to_test,
+                mean_final,
+                log_score,
+                ruin_probability,
+                p10,
+                cvar,
+            )
+
+            exact_start = time.perf_counter()
+            if gpu["cvar_mode"] == "exact_two_pass":
+                all_indices = list(range(n_fractions))
+                exact_map = _compute_exact_tail_metrics_via_memmap(
+                    config,
+                    fractions_to_test,
+                    all_indices,
+                    horizon_months,
+                    chunk_size,
+                    fraction_tile_size,
+                    use_cuda_backend,
+                )
+                _apply_exact_tail_metrics(diagnostics, exact_map, config)
+            elif gpu["cvar_refine_pass"]:
+                refine_indices = _select_refine_candidate_indices(
+                    diagnostics,
+                    config["risk"]["max_ruin_probability"],
+                    gpu["refine_top_k"],
+                )
+                exact_map = _compute_exact_tail_metrics_via_memmap(
+                    config,
+                    fractions_to_test,
+                    refine_indices,
+                    horizon_months,
+                    chunk_size,
+                    fraction_tile_size,
+                    use_cuda_backend,
+                )
+                _apply_exact_tail_metrics(diagnostics, exact_map, config)
+            reduction_time_ms += (time.perf_counter() - exact_start) * 1000.0
+            break
+        except Exception as exc:
+            if not use_cuda_backend or not _is_oom_error(exc):
+                raise
+
+            prev_chunk = chunk_size
+            prev_tile = fraction_tile_size
+            if chunk_size > min_chunk:
+                chunk_size = max(min_chunk, int(np.floor(chunk_size * gpu["oom_backoff_factor"])))
+            elif fraction_tile_size > 1:
+                fraction_tile_size = max(1, int(np.floor(fraction_tile_size * gpu["oom_backoff_factor"])))
+
+            if prev_chunk == chunk_size and prev_tile == fraction_tile_size:
+                raise
+            fallback_reasons.append(
+                "CUDA OOM encountered; backoff applied to "
+                f"chunk={chunk_size}, tile={fraction_tile_size}."
+            )
+
+    fallback_reason = "; ".join(fallback_reasons) if fallback_reasons else None
+    execution = {
+        "mode": "parallel",
+        "workers_used": int(gpu["streams"]),
+        "backend": "cuda" if use_cuda_backend else "numpy_streaming",
+        "start_method": None,
+        "fraction_tasks": int(n_fractions),
+        "fallback_reason": fallback_reason,
+        "gpu_name": gpu_meta["gpu_name"],
+        "driver_version": gpu_meta["driver_version"],
+        "cuda_runtime_version": None,
+        "device_memory_total_mb": gpu_meta["device_memory_total_mb"],
+        "device_memory_free_mb": gpu_meta.get("device_memory_free_mb"),
+        "chunk_size_used": int(chunk_size),
+        "fraction_tile_used": int(fraction_tile_size),
+        "precision_mode": gpu["precision_mode"],
+        "cvar_mode": gpu["cvar_mode"],
+        "kernel_time_ms": float(kernel_time_ms),
+        "transfer_time_ms": float(transfer_time_ms),
+        "reduction_time_ms": float(reduction_time_ms),
+    }
+    return diagnostics, execution, summary
+
+
 def _init_parallel_worker(universe, config):
     global _PARALLEL_UNIVERSE
     global _PARALLEL_CONFIG
@@ -670,6 +1486,18 @@ def _resolve_execution_settings(config, task_count):
         "start_method": None,
         "fraction_tasks": task_count,
         "fallback_reason": None,
+        "gpu_name": None,
+        "driver_version": None,
+        "cuda_runtime_version": None,
+        "device_memory_total_mb": None,
+        "device_memory_free_mb": None,
+        "chunk_size_used": None,
+        "fraction_tile_used": None,
+        "precision_mode": None,
+        "cvar_mode": None,
+        "kernel_time_ms": None,
+        "transfer_time_ms": None,
+        "reduction_time_ms": None,
     }
 
     if not simulation["parallel_enabled"]:
@@ -901,9 +1729,10 @@ def run_monte_carlo_optimization(config=None, verbose=True):
     merged_config = _deep_merge(DEFAULT_CONFIG, config or {})
     validate_config(merged_config)
 
-    universe = _generate_universe(merged_config)
     decision_grid = merged_config["decision_grid"]
     risk = merged_config["risk"]
+    simulation = merged_config["simulation"]
+    gpu = merged_config["gpu"]
 
     fractions_to_test = np.linspace(
         decision_grid["min_fraction"],
@@ -917,16 +1746,57 @@ def run_monte_carlo_optimization(config=None, verbose=True):
     if primary_objective_mode == "consensus":
         objective_label_for_table = "Mean - lambda*CVaR"
 
-    diagnostics, execution = _collect_fraction_metrics(
-        fractions_to_test,
-        universe,
-        merged_config,
-    )
+    gpu_error = None
+    if gpu["enabled"]:
+        try:
+            diagnostics, execution, universe_summary = _collect_fraction_metrics_streaming(
+                fractions_to_test,
+                merged_config,
+            )
+            n_sims_for_output = simulation["n_sims"]
+        except Exception as exc:
+            if not gpu["fallback_to_cpu_on_error"]:
+                raise
+            gpu_error = str(exc)
+            try:
+                streaming_fallback_cfg = _deep_merge(
+                    merged_config,
+                    {"gpu": {"enabled": True, "prefer_cuda_extension": False}},
+                )
+                diagnostics, execution, universe_summary = _collect_fraction_metrics_streaming(
+                    fractions_to_test,
+                    streaming_fallback_cfg,
+                )
+                n_sims_for_output = simulation["n_sims"]
+            except Exception:
+                universe = _generate_universe(merged_config)
+                diagnostics, execution = _collect_fraction_metrics(
+                    fractions_to_test,
+                    universe,
+                    merged_config,
+                )
+                universe_summary = universe["summary"]
+                n_sims_for_output = universe["n_sims"]
+    else:
+        universe = _generate_universe(merged_config)
+        diagnostics, execution = _collect_fraction_metrics(
+            fractions_to_test,
+            universe,
+            merged_config,
+        )
+        universe_summary = universe["summary"]
+        n_sims_for_output = universe["n_sims"]
+
+    if gpu_error is not None:
+        if execution["fallback_reason"] is None:
+            execution["fallback_reason"] = gpu_error
+        else:
+            execution["fallback_reason"] = f"{gpu_error}; {execution['fallback_reason']}"
 
     if verbose:
-        summary = universe["summary"]
+        summary = universe_summary
         cvar_label = f"CVaR{int(risk['alpha'] * 100)} Shortfall"
-        print(f"Running {universe['n_sims']:,} belief-weighted simulations...\n")
+        print(f"Running {n_sims_for_output:,} belief-weighted simulations...\n")
         print("Universe summary:")
         print(f"  Horizon months:              {summary['horizon_months']}")
         print(f"  Realized crash rate:         {summary['realized_crash_rate']:.1%}")
@@ -1001,7 +1871,7 @@ def run_monte_carlo_optimization(config=None, verbose=True):
         "max_ruin_probability": risk["max_ruin_probability"],
         "objective_comparison": mode_to_selection,
         "diagnostics_by_fraction": diagnostics,
-        "universe_summary": universe["summary"],
+        "universe_summary": universe_summary,
         "execution": execution,
     }
 
@@ -1014,7 +1884,29 @@ def run_monte_carlo_optimization(config=None, verbose=True):
         if execution["start_method"] is not None:
             print(f"Parallel start method:                 {execution['start_method']}")
         if execution["fallback_reason"] is not None:
-            print(f"Parallel fallback reason:              {execution['fallback_reason']}")
+            print(f"Backend fallback reason:               {execution['fallback_reason']}")
+        if execution["gpu_name"] is not None:
+            print(f"GPU device:                            {execution['gpu_name']}")
+        if execution["driver_version"] is not None:
+            print(f"GPU driver version:                    {execution['driver_version']}")
+        if execution["device_memory_total_mb"] is not None:
+            print(f"GPU memory total (MB):                 {execution['device_memory_total_mb']}")
+        if execution["device_memory_free_mb"] is not None:
+            print(f"GPU memory free (MB):                  {execution['device_memory_free_mb']}")
+        if execution["chunk_size_used"] is not None:
+            print(f"Scenario chunk size:                   {execution['chunk_size_used']:,}")
+        if execution["fraction_tile_used"] is not None:
+            print(f"Fraction tile size:                    {execution['fraction_tile_used']}")
+        if execution["precision_mode"] is not None:
+            print(f"GPU precision mode:                    {execution['precision_mode']}")
+        if execution["cvar_mode"] is not None:
+            print(f"CVaR mode:                             {execution['cvar_mode']}")
+        if execution["kernel_time_ms"] is not None:
+            print(f"Kernel time (ms):                      {execution['kernel_time_ms']:.1f}")
+        if execution["transfer_time_ms"] is not None:
+            print(f"Transfer time (ms):                    {execution['transfer_time_ms']:.1f}")
+        if execution["reduction_time_ms"] is not None:
+            print(f"Reduction time (ms):                   {execution['reduction_time_ms']:.1f}")
         print(f"Primary objective mode:                {primary_objective_mode}")
         print(f"Ruin probability guardrail:            <= {risk['max_ruin_probability']:.2%}")
         print(f"Recommended sell-today fraction:        {result['recommended_fraction'] * 100:.1f}%")

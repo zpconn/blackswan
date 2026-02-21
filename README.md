@@ -1,6 +1,6 @@
 # Crash Prep Optimizer
 
-`crash_prep_optimizer` is a Monte Carlo engine for a specific one-time decision:
+`crash_prep_optimizer` is a Monte Carlo engine for a specific one-time decision, with an optional C++/CUDA accelerator:
 
 - What fraction of a concentrated stock portfolio, held in post-tax brokerage accounts, should you sell today if you believe a stock market crash will happen in the near future?
 
@@ -59,6 +59,31 @@ python -m venv .venv
 . .venv/bin/activate
 pip install numpy pytest
 ```
+
+### Optional: build the CUDA extension
+
+If you want GPU acceleration through the native extension:
+
+```bash
+. .venv/bin/activate
+pip install -U pip
+pip install scikit-build-core pybind11
+pip install -e .
+```
+
+This builds `crash_prep_cuda` from:
+
+- `CMakeLists.txt`
+- `src/cuda/bindings.cpp`
+- `src/cuda/sim_kernel.cu`
+
+### One-command setup/build/benchmark helpers
+
+- `scripts/wsl2_cuda_setup.sh`: installs WSL2 build deps + CUDA toolkit
+- `scripts/build_and_benchmark_cuda.sh`: builds extension, runs tests, runs benchmark
+- `scripts/benchmark_backends.py`: compares CUDA-extension path vs numpy-streaming path
+
+If CUDA extension import fails, the benchmark now fails fast for the CUDA case instead of silently running a long CPU fallback.
 
 ## Quick Start
 
@@ -124,7 +149,7 @@ DEFAULT_CONFIG = {
         "market_yield_annual": 0.08,
     },
     "simulation": {
-        "n_sims": 500_000,
+        "n_sims": 10_000_000,
         "seed": 42,
         "min_horizon_months": 72,
         "horizon_months": None,
@@ -134,7 +159,7 @@ DEFAULT_CONFIG = {
         "crash_layoff_min_duration_months": 24,
         "baseline_layoff_min_duration_months": 1,
         "baseline_layoff_max_duration_months": 12,
-        "parallel_enabled": True,
+        "parallel_enabled": False,
         "parallel_workers": None,
         "parallel_start_method": None,
         "parallel_chunk_mode": "fractions",
@@ -162,6 +187,24 @@ DEFAULT_CONFIG = {
         "prob_layoff_during_crash": 0.50,
         "prob_layoff_baseline": 0.15,
     },
+    "gpu": {
+        "enabled": True,
+        "device_id": 0,
+        "scenario_chunk_size": 262_144,
+        "fraction_tile_size": 64,
+        "precision_mode": "mixed",
+        "cvar_mode": "streaming_near_exact",
+        "cvar_refine_pass": True,
+        "streams": 2,
+        "max_vram_utilization": 0.85,
+        "fallback_to_cpu_on_error": False,
+        "sample_size": 400_000,
+        "prefer_cuda_extension": True,
+        "refine_top_k": 5,
+        "exact_temp_dir": None,
+        "min_chunk_size": 32_768,
+        "oom_backoff_factor": 0.5,
+    },
 }
 ```
 
@@ -181,6 +224,14 @@ Supported distribution specs for beliefs:
 - `risk.shortfall_floor=None` defaults to `portfolio.initial_portfolio`.
 - `decision_grid.num_points=51` with min/max `[0,1]` yields fractions `0%, 2%, ..., 100%`.
 - `parallel_chunk_mode` currently supports only `"fractions"`.
+- `gpu.enabled=True` activates streaming backend dispatch with safe CPU fallback.
+- `gpu.prefer_cuda_extension=True` requires `crash_prep_cuda`; set `False` to use numpy streaming fallback.
+- `gpu.scenario_chunk_size` and `gpu.fraction_tile_size` control memory scaling at high `n_sims`.
+- `gpu.streams` controls true multi-stream CUDA fraction sharding in the aggregate kernel path.
+- `gpu.cvar_mode="streaming_near_exact"` uses bounded-memory tail estimation from sampled scenarios.
+- `gpu.cvar_mode="exact_two_pass"` performs an exact second pass using temporary memmap storage.
+- `gpu.cvar_refine_pass=True` recomputes exact tail metrics for top candidates in streaming mode.
+- `gpu.min_chunk_size` and `gpu.oom_backoff_factor` control automatic CUDA OOM retry behavior.
 
 ## Objective Modes
 
@@ -288,6 +339,20 @@ Check:
 - runtime allows multiprocessing primitives
 - `parallel_workers` is not effectively forced to 1
 
+### GPU requested but backend is not `cuda`
+
+Check:
+
+- `crash_prep_cuda` was built successfully (`pip install -e .`)
+- CUDA toolkit/build deps are present in WSL2
+- `gpu.prefer_cuda_extension` is set as intended
+- `execution.fallback_reason` for precise fallback details
+
+### Exact two-pass mode is slow or disk-heavy
+
+`gpu.cvar_mode="exact_two_pass"` writes temporary memmap files to compute exact tails.  
+Use `gpu.exact_temp_dir` to point at a fast disk with enough free space.
+
 ### `simulation.horizon_months is shorter than sampled crash windows`
 
 Your fixed horizon is too short for sampled crash timing/duration plus buffer. Increase `horizon_months` or set it back to `None`.
@@ -313,6 +378,9 @@ Current tests cover:
 ## Repository Layout
 
 - `crash_prep_optimizer.py`: simulation engine and optimizer
+- `gpu_backend.py`: CUDA extension integration and device metadata
+- `CMakeLists.txt`: native extension build configuration
+- `src/cuda/`: C++/CUDA kernel and pybind bindings
 - `tests/test_crash_prep_optimizer.py`: test suite
 
 ## Limitations and Assumptions
