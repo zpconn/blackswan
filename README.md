@@ -3,6 +3,8 @@
 
 # Blackswan
 
+https://github.com/user-attachments/assets/d154b26e-6413-4ffa-9b55-480b6ef06ef8
+
 Blackswan is a Monte Carlo decision engine for one specific one-time choice:
 
 - What fraction of a concentrated stock position should you sell today if you believe a crash may happen soon?
