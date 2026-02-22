@@ -1,3 +1,6 @@
+
+<img width="1536" height="1024" alt="blackswan-logo" src="https://github.com/user-attachments/assets/ec7a95b6-e398-41e7-bb0e-a5a9d2a6ba36" />
+
 # Blackswan
 
 Blackswan is a Monte Carlo decision engine for one specific one-time choice:
