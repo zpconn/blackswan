@@ -1,54 +1,310 @@
-# Crash Prep Optimizer
+# Blackswan
 
-`crash_prep_optimizer` is a Monte Carlo engine for a specific one-time decision:
+Blackswan is a Monte Carlo decision engine for one specific one-time choice:
 
-- What fraction of a concentrated stock portfolio, held in post-tax brokerage accounts, should you sell today if you believe a stock market crash will happen in the near future?
+- What fraction of a concentrated stock position should you sell today if you believe a crash may happen soon?
 
-It simulates many possible futures (market crashes, recovery paths, layoffs, cash burn, and taxes), evaluates a grid of sell fractions, applies a ruin-probability guardrail, and returns the recommended fraction under the chosen objective.
+It models crash timing/severity, layoffs, cash burn, taxes, and monthly saving behavior across many simulated futures, then recommends the sell-today fraction that best matches your selected objective under a ruin-probability guardrail.
 
 ## Table of Contents
 
-1. [What This Model Solves](#what-this-model-solves)
-2. [Core Terms](#core-terms)
-3. [How It Works](#how-it-works)
-4. [Installation](#installation)
-5. [Quick Start](#quick-start)
-6. [Configuration](#configuration)
-7. [Objective Modes](#objective-modes)
-8. [Parallel Execution Model](#parallel-execution-model)
-9. [Result Schema](#result-schema)
-10. [Troubleshooting](#troubleshooting)
-11. [Testing](#testing)
-12. [Repository Layout](#repository-layout)
-13. [Limitations and Assumptions](#limitations-and-assumptions)
+1. [What This Actually Does](#what-this-actually-does)
+2. [End-to-End Architecture](#end-to-end-architecture)
+3. [Algorithm Deep Dive](#algorithm-deep-dive)
+4. [Multiprocessing Deep Dive (CPU Path)](#multiprocessing-deep-dive-cpu-path)
+5. [GPU Processing Deep Dive (Streaming Path)](#gpu-processing-deep-dive-streaming-path)
+6. [Memory Management Deep Dive](#memory-management-deep-dive)
+7. [Installation](#installation)
+8. [Quick Start](#quick-start)
+9. [Blackswan TUI (Charm Stack)](#blackswan-tui-charm-stack)
+10. [Configuration Guide](#configuration-guide)
+11. [Objective Modes](#objective-modes)
+12. [Result Schema](#result-schema)
+13. [Troubleshooting](#troubleshooting)
+14. [Testing](#testing)
+15. [Repository Layout](#repository-layout)
+16. [Limitations and Assumptions](#limitations-and-assumptions)
 
-## What This Model Solves
+## What This Actually Does
 
-Given beliefs about crash odds/severity and job loss risk, the optimizer answers:
+At run time, Blackswan:
 
-- Sell `x%` of portfolio now, pay tax now, keep the rest invested.
-- Then evaluate the long-run wealth and downside risk of that choice across many simulated futures.
+1. Merges your config with defaults and validates constraints.
+2. Builds a grid of candidate sell fractions (for example, 0%, 2%, ..., 100%).
+3. Simulates many scenario paths (`n_sims`) using your crash/layoff beliefs.
+4. Evaluates every candidate fraction against the same scenario universe (CPU path) or the same streaming scenario process (GPU/streaming path).
+5. Computes risk and utility metrics per fraction.
+6. Applies the ruin guardrail (`risk.max_ruin_probability`).
+7. Selects winners for all objective modes (`cvar_shortfall`, `expected_log_utility`, `consensus`) and returns the primary-mode recommendation.
 
-The decision is explicitly one-time (`fraction_sold_today`), not a dynamic trading policy.
+Decision scope is intentionally narrow: one immediate sell decision (`fraction_sold_today`), not a dynamic trading policy.
 
-## Core Terms
+## End-to-End Architecture
 
-- `scenario`: one simulated future path across the full horizon (returns, crash timing/severity, unemployment).
-- `strategy option`: one candidate sell fraction from the decision grid.
-- `guardrail`: max allowed ruin probability (`risk.max_ruin_probability`).
-- `CVaR shortfall`: average tail shortfall (worst `alpha` fraction) relative to `shortfall_floor`.
-- `consensus`: minimax-regret compromise between CVaR-style and log-utility objectives.
+```text
++---------------------+      +----------------------+      +-----------------------+
+| JSON config +       | ---> | Scenario generation  | ---> | Fraction evaluation   |
+| belief distributions|      | (crash + layoff +    |      | (each candidate sell  |
+|                     |      | monthly returns)     |      | fraction)             |
++---------------------+      +----------------------+      +-----------------------+
+                                                                     |
+                                                                     v
+                                                        +---------------------------+
+                                                        | Metrics per fraction      |
+                                                        | mean, p10, CVaR, ruin, log|
+                                                        +---------------------------+
+                                                                     |
+                                                                     v
+                                                        +---------------------------+
+                                                        | Guardrail filter +         |
+                                                        | objective selection        |
+                                                        +---------------------------+
+                                                                     |
+                                                                     v
+                                                        +---------------------------+
+                                                        | recommended_fraction       |
+                                                        +---------------------------+
+```
 
-## How It Works
+Execution routing inside `run_monte_carlo_optimization`:
 
-1. Merge user config onto defaults.
-2. Validate config fields and constraints.
-3. Generate one shared simulation universe with `n_sims` scenarios.
-4. Build decision grid from `min_fraction` to `max_fraction`.
-5. For each strategy option (each fraction), run the month-by-month wealth simulation across all scenarios and compute metrics (expected wealth, CVaR shortfall, ruin probability, log utility, etc.).
-6. Filter strategies by ruin guardrail.
-7. Pick winners for `cvar_shortfall`, `expected_log_utility`, and `consensus`.
-8. Return the primary mode result plus cross-checks for the other modes.
+```text
+run_monte_carlo_optimization
+        |
+        +-- gpu.enabled = true?
+        |       |
+        |       +-- yes -> streaming evaluator
+        |              |
+        |              +-- prefer_cuda_extension and extension available -> CUDA backend
+        |              |
+        |              +-- otherwise -> numpy_streaming backend
+        |              |
+        |              +-- on failure + fallback_to_cpu_on_error=true:
+        |                     1) retry streaming with numpy backend
+        |                     2) if still failing, fallback to full CPU path
+        |
+        +-- no  -> full CPU universe + per-fraction evaluation
+```
+
+## Algorithm Deep Dive
+
+### Core terms
+
+- `scenario`: one full future path across all months.
+- `fraction`: candidate sell-today proportion from decision grid.
+- `guardrail`: max allowed ruin probability.
+- `CVaR shortfall`: mean shortfall in worst `alpha` tail.
+
+### Step 1: Build scenario universe
+
+For each scenario, the model samples:
+
+- crash occurrence probability
+- crash start month, duration, severity
+- layoff probability in crash and non-crash states
+
+It then generates monthly returns and unemployment flags over the resolved horizon.
+
+Crash/recovery behavior is modeled by applying a down-drift phase then an up-drift phase so the crash severity and duration shape the return path.
+
+### Step 2: Simulate portfolio cashflows for a fixed fraction
+
+Given one sell fraction `f`:
+
+- sell `f * initial_portfolio` at time zero
+- pay LTCG tax on sold gains
+- hold proceeds in cash and leave the rest invested
+- each month:
+  - apply market return and cash yield
+  - if employed: add monthly savings to stock basis/holdings
+  - if unemployed: cover expenses from cash, then liquidate stock if needed (with tax-aware net proceeds)
+- at horizon end: apply tax on remaining unrealized gains
+
+The simulator returns per-scenario final net worth and ruin flags.
+
+### Step 3: Score each fraction
+
+For each fraction:
+
+- `expected_final_net_worth = mean(final_net_worth)`
+- `p10_final_net_worth = 10th percentile`
+- `ruin_probability = mean(ruined)`
+- `shortfall = max(0, shortfall_floor - final_net_worth)`
+- `cvar_shortfall = mean(worst alpha tail of shortfall)`
+- `cvar_objective_score = mean_final - lambda * cvar_shortfall`
+- `log_utility_score = mean(log(max(final_net_worth, log_utility_wealth_floor)))`
+
+### Step 4: Guardrail and objective selection
+
+Every objective first filters to strategies with:
+
+- `ruin_probability <= risk.max_ruin_probability`
+
+Then:
+
+- `cvar_shortfall` mode selects highest `cvar_objective_score`.
+- `expected_log_utility` mode selects highest `log_utility_score`.
+- `consensus` mode minimizes normalized max regret across both objectives, with tolerance-based pass set and fallback to closest compromise if pass set is empty.
+
+## Multiprocessing Deep Dive (CPU Path)
+
+There are two distinct process layers in this project:
+
+1. Run orchestration layer (`python_service/blackswan_service.py`):
+   - each submitted run executes in its own `multiprocessing.Process`
+2. Optional fraction-evaluation layer (inside `blackswan.py`):
+   - if `simulation.parallel_enabled=true`, a `ProcessPoolExecutor` fans out fraction tasks
+
+```text
+TUI / caller
+    |
+    v
++-------------------------------+
+| python_service HTTP/SSE layer |
+| (threaded server)             |
++---------------+---------------+
+                |
+                v
+      mp.Process per run
+                |
+                +--> run_monte_carlo_optimization
+                         |
+                         +--> optional ProcessPoolExecutor
+                               (fraction-parallel CPU mode)
+```
+
+CPU parallelism is fraction-parallel, not scenario-parallel.
+
+- One universe is generated for the run.
+- Tasks are `(index, fraction)` pairs.
+- Worker processes evaluate fractions independently.
+
+```text
++---------------------------+
+| Main process              |
+| - generate universe       |
+| - build fraction task list|
++-------------+-------------+
+              |
+              v
++---------------------------+      +---------------------------+
+| Worker process 1          |      | Worker process 2          |
+| evaluate fraction i       | ...  | evaluate fraction j       |
++-------------+-------------+      +-------------+-------------+
+              \                         /
+               \                       /
+                +---------------------+
+                | collect + order by i |
+                +---------------------+
+```
+
+Key behavior:
+
+- Enabled by `simulation.parallel_enabled`.
+- Worker count defaults to `os.cpu_count()` (capped by task count) if `parallel_workers` is `None`.
+- Parallel start method is auto-selected (`fork` preferred on POSIX, else `spawn`) unless overridden.
+- If parallel execution fails, engine falls back to single-threaded evaluation and stores `execution.fallback_reason`.
+
+## GPU Processing Deep Dive (Streaming Path)
+
+When `gpu.enabled=true`, the engine uses a streaming evaluator that avoids holding all scenario outputs in RAM at once.
+
+### Streaming loop
+
+```text
+for each scenario chunk:
+    generate chunk (host-side OR synthetic device generation)
+    for each fraction tile:
+        run backend kernel/evaluator
+        accumulate: sum_final, sum_log, ruin_count
+        optionally collect sampled final values for tail estimation
+```
+
+### Backends
+
+- `cuda`: uses `blackswan_cuda` extension via `gpu_backend.py`.
+- `numpy_streaming`: same chunk/tile flow, but reduced with NumPy on host.
+
+### CVaR modes
+
+- `streaming_near_exact`:
+  - keeps bounded samples per fraction (`gpu.sample_size`)
+  - computes tail metrics from sampled matrix
+  - optional exact refine pass on top candidates (`gpu.cvar_refine_pass`, `gpu.refine_top_k`)
+- `exact_two_pass`:
+  - performs a full exact tail pass for all fractions using memmap-backed storage
+  - requires more host RAM and disk
+
+## Memory Management Deep Dive
+
+Blackswan has explicit memory controls for GPU VRAM, host RAM, and temporary disk.
+
+### 1) VRAM-aware geometry tuning
+
+Initial geometry:
+
+- `chunk_size = min(n_sims, gpu.scenario_chunk_size)`
+- `fraction_tile_size = min(n_fractions, gpu.fraction_tile_size)`
+
+If CUDA is used and device memory is known:
+
+- estimate working set bytes
+- budget = `max_vram_utilization * (free_or_total_vram)`
+- shrink chunk/tile until estimated usage fits budget
+
+```text
+estimate(chunk, tile, horizon, sample_count)
+        |
+        +-- fits budget? yes -> run
+        |
+        +-- no -> shrink tile or chunk -> re-estimate
+```
+
+### 2) Runtime OOM backoff
+
+If CUDA still OOMs at runtime:
+
+- reduce `chunk_size` by `gpu.oom_backoff_factor` until `gpu.min_chunk_size`
+- then reduce `fraction_tile_size`
+- retry until no further reduction is possible
+
+### 3) Host memory controls for tail reduction
+
+Auto tail-reduction worker count is memory-aware:
+
+- starts from CPU/task limits
+- caps workers based on available memory and estimated bytes per worker
+
+For exact/refine passes, resource checks run before execution:
+
+- memmap disk demand must be <= ~80% of free temp-disk capacity
+- one-worker host reduction estimate must be <= ~70% of available RAM
+
+When checks fail:
+
+- `exact_two_pass`: run fails with clear message (exact mode is required)
+- refine pass: refinement is skipped and reason is recorded
+
+### 4) Lifecycle cleanup
+
+- Large sample matrix is explicitly dropped before exact/refine stages.
+- `gc.collect()` is triggered after dropping sampled data.
+- Memmap files for exact passes are removed after use.
+
+Exact tail memmap layout (disk-backed):
+
+```text
+temp file (float64 memmap)
+shape = [subset_fraction_count, n_sims]
+
+row 0 -> final wealth values for fraction A across all scenarios
+row 1 -> final wealth values for fraction B across all scenarios
+...
+
+write phase: chunk/tile simulation appends columns
+reduce phase: percentile/CVaR computed row-by-row
+cleanup phase: memmap file deleted
+```
 
 ## Installation
 
@@ -60,19 +316,40 @@ python -m venv .venv
 pip install numpy pytest
 ```
 
+### Optional: build CUDA extension
+
+```bash
+. .venv/bin/activate
+pip install -U pip
+pip install scikit-build-core pybind11
+pip install -e .
+```
+
+Build sources:
+
+- `CMakeLists.txt`
+- `src/cuda/bindings.cpp`
+- `src/cuda/sim_kernel.cu`
+
+Helper scripts:
+
+- `scripts/wsl2_cuda_setup.sh`
+- `scripts/build_and_benchmark_cuda.sh`
+- `scripts/benchmark_backends.py`
+
 ## Quick Start
 
 ### Run with defaults
 
 ```bash
 . .venv/bin/activate
-python crash_prep_optimizer.py
+python blackswan.py
 ```
 
-### Run from Python with custom config
+### Run from Python
 
 ```python
-from crash_prep_optimizer import run_monte_carlo_optimization
+from blackswan import run_monte_carlo_optimization
 
 result = run_monte_carlo_optimization(
     config={
@@ -93,94 +370,93 @@ print("Execution metadata:", result["execution"])
 print("Recommended fraction:", result["recommended_fraction"])
 ```
 
-### Safe one-liner shell form
-
-Use single quotes around the whole `-c` script and double quotes inside Python:
+### Shell one-liner
 
 ```bash
-. .venv/bin/activate && python -u -c 'from crash_prep_optimizer import run_monte_carlo_optimization; r = run_monte_carlo_optimization(config={"simulation":{"n_sims":5_000_001,"parallel_enabled":True,"parallel_workers":None},"risk":{"objective_mode":"consensus","max_ruin_probability":0.005}}, verbose=True); print("\nExecution metadata:", r["execution"])'
+. .venv/bin/activate && python -u -c 'from blackswan import run_monte_carlo_optimization; r = run_monte_carlo_optimization(config={"simulation":{"n_sims":5000001,"parallel_enabled":True,"parallel_workers":None},"risk":{"objective_mode":"consensus","max_ruin_probability":0.005}}, verbose=True); print("\nExecution metadata:", r["execution"])'
 ```
 
-## Configuration
+## Blackswan TUI (Charm Stack)
 
-### Merge Behavior
+`blackswan-tui` is a local terminal cockpit built with Bubble Tea + Bubbles + Lip Gloss.
+It launches a local Python service, streams live telemetry, and stores run bundles.
 
-`run_monte_carlo_optimization(config=...)` deep-merges overrides into `DEFAULT_CONFIG`, so you can override only the fields you care about.
+### TUI prerequisites
 
-### Full Default Config
+- Go `1.22+`
+- Python virtualenv at `.venv`
+- Optional CUDA extension if you want `gpu.prefer_cuda_extension=true`
 
-```python
-DEFAULT_CONFIG = {
-    "portfolio": {
-        "initial_portfolio": 2_500_000.0,
-        "initial_basis": 1_250_000.0,
-        "ltcg_tax_rate": 0.15,
-        "monthly_expenses": 6_000.0,
-        "monthly_savings": 8_000.0,
-    },
-    "market": {
-        "volatility_annual": 0.15,
-        "cash_yield_annual": 0.04,
-        "market_yield_annual": 0.08,
-    },
-    "simulation": {
-        "n_sims": 500_000,
-        "seed": 42,
-        "min_horizon_months": 72,
-        "horizon_months": None,
-        "max_horizon_months": 240,
-        "post_crash_buffer_months": 24,
-        "layoff_probabilities_are_annual": True,
-        "crash_layoff_min_duration_months": 24,
-        "baseline_layoff_min_duration_months": 1,
-        "baseline_layoff_max_duration_months": 12,
-        "parallel_enabled": True,
-        "parallel_workers": None,
-        "parallel_start_method": None,
-        "parallel_chunk_mode": "fractions",
-        "parallel_min_fraction_tasks": 2,
-    },
-    "decision_grid": {
-        "min_fraction": 0.0,
-        "max_fraction": 1.0,
-        "num_points": 51,
-    },
-    "risk": {
-        "alpha": 0.10,
-        "lambda": 0.50,
-        "shortfall_floor": None,
-        "objective_mode": "cvar_shortfall",
-        "max_ruin_probability": 0.005,
-        "log_utility_wealth_floor": 1.0,
-        "consensus_tolerance": 0.002,
-    },
-    "beliefs": {
-        "prob_crash": 0.80,
-        "crash_start_month": {"dist": "uniform", "low": 1, "high": 24},
-        "crash_duration_months": {"dist": "triangular", "left": 36, "mode": 60, "right": 96},
-        "crash_severity_drop": {"dist": "triangular", "left": 0.45, "mode": 0.50, "right": 0.55},
-        "prob_layoff_during_crash": 0.50,
-        "prob_layoff_baseline": 0.15,
-    },
-}
+### Run the TUI
+
+```bash
+. .venv/bin/activate
+go run ./cmd/blackswan-tui
 ```
 
-### Distribution Specs
+### Core controls
 
-Supported distribution specs for beliefs:
+- `ctrl+r`: start run with current JSON config
+- `ctrl+x`: cancel active run
+- `tab` / `shift+tab`: cycle focus panes
+- `up` / `down` or mouse wheel: scroll focused pane
+- `enter`: load selected history bundle
+- `ctrl+l`: clear telemetry
+- `q` or `ctrl+c`: quit
+
+### Service API used by the TUI
+
+- `POST /runs`
+- `GET /runs/{id}`
+- `GET /runs/{id}/stream` (SSE)
+- `POST /runs/{id}/cancel`
+
+## Configuration Guide
+
+### Merge behavior
+
+`run_monte_carlo_optimization(config=...)` deep-merges your overrides onto `DEFAULT_CONFIG`.
+
+### Most important knobs
+
+- Simulation scale:
+  - `simulation.n_sims`
+  - `decision_grid.num_points`
+- Risk behavior:
+  - `risk.objective_mode`
+  - `risk.max_ruin_probability`
+  - `risk.alpha`, `risk.lambda`, `risk.shortfall_floor`
+- CPU parallel:
+  - `simulation.parallel_enabled`
+  - `simulation.parallel_workers`
+  - `simulation.parallel_start_method`
+- GPU/streaming:
+  - `gpu.enabled`
+  - `gpu.prefer_cuda_extension`
+  - `gpu.cvar_mode`
+  - `gpu.scenario_chunk_size`, `gpu.fraction_tile_size`
+  - `gpu.max_vram_utilization`
+  - `gpu.fallback_to_cpu_on_error`
+
+### Distribution specs for beliefs
 
 - `beta`: `{"dist":"beta","a":...,"b":...,"low":...,"high":...}`
 - `triangular`: `{"dist":"triangular","left":...,"mode":...,"right":...}`
 - `uniform`: `{"dist":"uniform","low":...,"high":...}`
 - `lognormal`: `{"dist":"lognormal","mean":...,"sigma":...,"clip_low":...,"clip_high":...}`
-- scalar number: treated as a fixed constant in all scenarios
+- scalar number: fixed value for all scenarios
 
-### Important Config Notes
+### Inspect full defaults
 
-- `simulation.horizon_months=None` means horizon is auto-sized to crash timing + post-crash buffer, bounded by `max_horizon_months`.
-- `risk.shortfall_floor=None` defaults to `portfolio.initial_portfolio`.
-- `decision_grid.num_points=51` with min/max `[0,1]` yields fractions `0%, 2%, ..., 100%`.
-- `parallel_chunk_mode` currently supports only `"fractions"`.
+The authoritative defaults live in `blackswan.py` as `DEFAULT_CONFIG`.
+
+```bash
+python - <<'PY'
+from pprint import pprint
+from blackswan import DEFAULT_CONFIG
+pprint(DEFAULT_CONFIG)
+PY
+```
 
 ## Objective Modes
 
@@ -190,58 +466,27 @@ Supported primary modes (`risk.objective_mode`):
 - `expected_log_utility`
 - `consensus`
 
-### `cvar_shortfall`
+### cvar_shortfall
 
 - Shortfall per scenario: `max(0, shortfall_floor - final_net_worth)`
-- `CVaR(shortfall, alpha)`: mean of worst `alpha` tail
-- Objective: `mean_final_net_worth - lambda * cvar_shortfall`
+- Objective: `mean_final_net_worth - lambda * CVaR_alpha(shortfall)`
 - Higher is better
 
-### `expected_log_utility`
+### expected_log_utility
 
 - Utility per scenario: `log(max(final_net_worth, log_utility_wealth_floor))`
 - Objective: mean utility
 - Higher is better
 
-### `consensus`
+### consensus
 
-- Compute regrets to the best eligible strategy on each objective.
-- `cvar_regret`: normalized regret vs best CVaR objective score
-- `log_regret`: normalized regret vs best log-utility score
-- `max_regret = max(cvar_regret, log_regret)`
-- Strategies pass consensus filter if both regrets are `<= consensus_tolerance`
-- If pass-set is empty, fallback chooses smallest regret compromise from all eligible strategies
-
-## Parallel Execution Model
-
-Parallelism is across strategy options (fractions), not across scenario count.
-
-- `n_sims` controls total scenario universe size.
-- That same universe is reused for each strategy option.
-- Worker processes each evaluate one fraction task at a time.
-- Execution metadata is returned in `result["execution"]`.
-
-This means:
-
-- not "n_sims per process"
-- not "n_sims split across processes"
-- yes "fractions split across processes"
-
-### Worker Resolution
-
-- If `parallel_workers=None`, uses `os.cpu_count()` capped by number of tasks.
-- If only one worker is effectively available, execution mode is single-thread.
-- If parallel execution throws, code falls back to single mode and records `fallback_reason`.
-
-### Start Method
-
-- Default on POSIX prefers `fork` when available.
-- Otherwise it uses `spawn` if available.
-- You can override via `simulation.parallel_start_method`.
+- Compute normalized regrets against best eligible CVaR and log-utility strategies
+- Minimize worst-case regret (`max_regret`)
+- If no candidate is within `consensus_tolerance` on both regrets, choose nearest compromise
 
 ## Result Schema
 
-Top-level return keys from `run_monte_carlo_optimization(...)`:
+Top-level result keys:
 
 - `recommended_fraction`
 - `objective_score`
@@ -258,70 +503,81 @@ Top-level return keys from `run_monte_carlo_optimization(...)`:
 - `universe_summary`
 - `execution`
 
-`execution` includes:
+Execution metadata includes:
 
-- `mode`: `"single"` or `"parallel"`
-- `workers_used`
-- `backend`
-- `start_method`
-- `fraction_tasks`
-- `fallback_reason`
-
-`objective_comparison` always contains all three objective selections, even if one mode is primary.
+- universal fields: `mode`, `workers_used`, `backend`, `start_method`, `fraction_tasks`, `fallback_reason`
+- streaming/CUDA fields when applicable: `gpu_name`, `driver_version`, `device_memory_total_mb`, `device_memory_free_mb`, `chunk_size_used`, `fraction_tile_used`, `precision_mode`, `cvar_mode`, `kernel_time_ms`, `transfer_time_ms`, `reduction_time_ms`
 
 ## Troubleshooting
 
 ### `No strategy satisfies the ruin probability guardrail`
 
-The current assumptions are too strict for `risk.max_ruin_probability`. Options:
+Assumptions are too strict for current guardrail. You can:
 
-- raise `max_ruin_probability`
+- raise `risk.max_ruin_probability`
 - reduce downside assumptions
-- adjust portfolio/cash-flow assumptions
+- adjust portfolio/cashflow assumptions
 
-### Parallel requested but execution shows single mode
+### Parallel requested but execution shows single
 
 Check:
 
 - `simulation.parallel_enabled` is `True`
-- `decision_grid` has enough tasks (see `parallel_min_fraction_tasks`)
-- runtime allows multiprocessing primitives
-- `parallel_workers` is not effectively forced to 1
+- `decision_grid.num_points` is high enough vs `parallel_min_fraction_tasks`
+- `parallel_workers` is not effectively `1`
+- start method compatibility on your platform
 
-### `simulation.horizon_months is shorter than sampled crash windows`
+### GPU requested but backend is not `cuda`
 
-Your fixed horizon is too short for sampled crash timing/duration plus buffer. Increase `horizon_months` or set it back to `None`.
+Check:
+
+- CUDA extension build (`pip install -e .`)
+- `gpu.prefer_cuda_extension`
+- `execution.fallback_reason`
+- `gpu.fallback_to_cpu_on_error`
+
+### `exact_two_pass` is slow or disk-heavy
+
+`gpu.cvar_mode="exact_two_pass"` writes a large memmap file for exact tails.
+Set `gpu.exact_temp_dir` to a fast disk with plenty of free space.
 
 ## Testing
 
-Run all tests:
+Run tests:
 
 ```bash
 . .venv/bin/activate
 pytest -q
 ```
 
-Current tests cover:
+Coverage includes:
 
-- config validation for parallel settings
-- smoke runs for all objectives in single and parallel modes
+- config validation
+- objective smoke tests
 - single vs parallel consistency
-- consensus fields
-- guardrail failure behavior
-- worker resolution and single-worker behavior
+- consensus outputs
+- guardrail failures
+- worker resolution and GPU fallback behavior
 
 ## Repository Layout
 
-- `crash_prep_optimizer.py`: simulation engine and optimizer
-- `tests/test_crash_prep_optimizer.py`: test suite
+- `blackswan.py`: simulation engine + objective selection
+- `gpu_backend.py`: CUDA extension adapter + GPU metadata
+- `src/cuda/`: CUDA kernels + bindings
+- `python_service/blackswan_service.py`: local authenticated HTTP/SSE run service
+- `cmd/blackswan-tui/main.go`: TUI entrypoint
+- `internal/app/`: Bubble Tea state/view logic
+- `internal/service/`: Go service manager and SSE client
+- `internal/storage/`: run bundle persistence
+- `tests/test_blackswan.py`: test suite
 
 ## Limitations and Assumptions
 
-- This is a scenario model, not a guarantee.
-- Output depends heavily on belief distributions and cash-flow assumptions.
-- Action space is a one-time sell fraction, not a dynamic multi-step strategy.
-- Tax modeling is simplified (single LTCG rate and basis treatment).
-- Parallel behavior and speed depend on OS start method and memory constraints.
+- Scenario model, not a guarantee.
+- Output is highly sensitive to beliefs and cashflow assumptions.
+- Action space is a one-time sell fraction, not a dynamic strategy.
+- Tax model is intentionally simplified.
+- Runtime and memory behavior depend on hardware, start method, and config.
 
 ## Disclaimer
 
