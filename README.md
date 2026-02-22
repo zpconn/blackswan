@@ -1,6 +1,6 @@
-# Crash Prep Optimizer
+# Blackswan
 
-`crash_prep_optimizer` is a Monte Carlo engine for a specific one-time decision, with an optional C++/CUDA accelerator:
+`blackswan` is a Monte Carlo engine for a specific one-time decision, with an optional C++/CUDA accelerator:
 
 - What fraction of a concentrated stock portfolio, held in post-tax brokerage accounts, should you sell today if you believe a stock market crash will happen in the near future?
 
@@ -71,7 +71,7 @@ pip install scikit-build-core pybind11
 pip install -e .
 ```
 
-This builds `crash_prep_cuda` from:
+This builds `blackswan_cuda` from:
 
 - `CMakeLists.txt`
 - `src/cuda/bindings.cpp`
@@ -91,13 +91,13 @@ If CUDA extension import fails, the benchmark now fails fast for the CUDA case i
 
 ```bash
 . .venv/bin/activate
-python crash_prep_optimizer.py
+python blackswan.py
 ```
 
 ### Run from Python with custom config
 
 ```python
-from crash_prep_optimizer import run_monte_carlo_optimization
+from blackswan import run_monte_carlo_optimization
 
 result = run_monte_carlo_optimization(
     config={
@@ -123,7 +123,7 @@ print("Recommended fraction:", result["recommended_fraction"])
 Use single quotes around the whole `-c` script and double quotes inside Python:
 
 ```bash
-. .venv/bin/activate && python -u -c 'from crash_prep_optimizer import run_monte_carlo_optimization; r = run_monte_carlo_optimization(config={"simulation":{"n_sims":5_000_001,"parallel_enabled":True,"parallel_workers":None},"risk":{"objective_mode":"consensus","max_ruin_probability":0.005}}, verbose=True); print("\nExecution metadata:", r["execution"])'
+. .venv/bin/activate && python -u -c 'from blackswan import run_monte_carlo_optimization; r = run_monte_carlo_optimization(config={"simulation":{"n_sims":5_000_001,"parallel_enabled":True,"parallel_workers":None},"risk":{"objective_mode":"consensus","max_ruin_probability":0.005}}, verbose=True); print("\nExecution metadata:", r["execution"])'
 ```
 
 ## Configuration
@@ -229,7 +229,7 @@ Supported distribution specs for beliefs:
 - `gpu.enabled=True` activates streaming backend dispatch.
 - CPU fallback on GPU errors is controlled by `gpu.fallback_to_cpu_on_error`:
   default is `False` (raise error), set `True` to allow fallback.
-- `gpu.prefer_cuda_extension=True` requires `crash_prep_cuda`; set `False` to use numpy streaming fallback.
+- `gpu.prefer_cuda_extension=True` requires `blackswan_cuda`; set `False` to use numpy streaming fallback.
 - `gpu.device_scenario_generation=True` synthesizes scenarios directly on GPU when supported.
 - Device-side scenario generation is currently supported when:
   `beliefs.prob_crash`, `beliefs.prob_layoff_during_crash`, and `beliefs.prob_layoff_baseline`
@@ -368,7 +368,7 @@ Check:
 
 Check:
 
-- `crash_prep_cuda` was built successfully (`pip install -e .`)
+- `blackswan_cuda` was built successfully (`pip install -e .`)
 - CUDA toolkit/build deps are present in WSL2
 - `gpu.prefer_cuda_extension` is set as intended
 - `execution.fallback_reason` for precise fallback details
@@ -379,6 +379,8 @@ Check:
 
 `gpu.cvar_mode="exact_two_pass"` writes temporary memmap files to compute exact tails.  
 Use `gpu.exact_temp_dir` to point at a fast disk with enough free space.
+If temp-disk or host-memory budget is insufficient, the run now fails fast with a clear error
+instead of continuing into a likely crash.
 
 ### End-of-run CPU bottleneck during tail reduction
 
@@ -387,6 +389,9 @@ Tail metrics (percentile/CVaR) are reduced on CPU. If one core appears saturated
 - leave `gpu.reduction_workers=None` (auto) or set it explicitly (for example, `8` or `12`)
 - keep `gpu.cvar_mode="streaming_near_exact"` with `gpu.cvar_refine_pass=True` for faster near-exact runs
 - use `gpu.cvar_mode="exact_two_pass"` only when full exact tails are required
+
+For very large runs, the engine may skip the optional exact refine pass if host resources are too
+tight; check `execution.fallback_reason` for the exact reason.
 
 ### `simulation.horizon_months is shorter than sampled crash windows`
 
@@ -412,11 +417,11 @@ Current tests cover:
 
 ## Repository Layout
 
-- `crash_prep_optimizer.py`: simulation engine and optimizer
+- `blackswan.py`: simulation engine and optimizer
 - `gpu_backend.py`: CUDA extension integration and device metadata
 - `CMakeLists.txt`: native extension build configuration
 - `src/cuda/`: C++/CUDA kernel and pybind bindings
-- `tests/test_crash_prep_optimizer.py`: test suite
+- `tests/test_blackswan.py`: test suite
 
 ## Limitations and Assumptions
 

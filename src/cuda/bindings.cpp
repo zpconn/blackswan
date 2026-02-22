@@ -869,8 +869,8 @@ py::tuple simulate_fraction_tile_synthetic(
 
 }  // namespace
 
-PYBIND11_MODULE(crash_prep_cuda, m) {
-    m.doc() = "CUDA accelerator for crash_prep_optimizer";
+PYBIND11_MODULE(blackswan_cuda, m) {
+    m.doc() = "CUDA accelerator for blackswan";
     m.def(
         "simulate_fraction_tile",
         &simulate_fraction_tile,

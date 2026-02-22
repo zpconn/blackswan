@@ -1,7 +1,9 @@
 import concurrent.futures
 from copy import deepcopy
+import gc
 import multiprocessing
 import os
+import shutil
 import tempfile
 import time
 
@@ -436,10 +438,100 @@ def _resolve_tail_reduction_workers(config, task_count, values_per_task):
     return max(1, workers)
 
 
-def _compute_tail_metrics_from_final_values(final_values, shortfall_floor, alpha):
-    p10 = float(np.percentile(final_values, 10))
-    shortfall = np.maximum(0.0, shortfall_floor - final_values)
-    cvar = float(_compute_cvar(shortfall, alpha))
+def _format_bytes(num_bytes):
+    if num_bytes is None:
+        return "unknown"
+
+    value = float(num_bytes)
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if value < 1024.0 or candidate == units[-1]:
+            break
+        value /= 1024.0
+
+    if unit == "B":
+        return f"{int(value)}{unit}"
+    return f"{value:.1f}{unit}"
+
+
+def _estimate_exact_tail_memmap_bytes(n_sims, subset_size):
+    return int(n_sims) * int(subset_size) * 8
+
+
+def _estimate_exact_tail_reduction_bytes(values_per_task, alpha):
+    if values_per_task <= 0:
+        return 0
+    tail_count = max(1, int(np.ceil(alpha * values_per_task)))
+    # In-place percentile/partition work plus tail-shortfall workspace.
+    return int(values_per_task) * 16 + int(tail_count) * 8
+
+
+def _can_run_exact_tail_pass(config, subset_size, values_per_task):
+    if subset_size <= 0 or values_per_task <= 0:
+        return True, None
+
+    gpu = config["gpu"]
+    temp_dir = gpu["exact_temp_dir"] or tempfile.gettempdir()
+    memmap_bytes = _estimate_exact_tail_memmap_bytes(values_per_task, subset_size)
+
+    free_disk_bytes = None
+    try:
+        free_disk_bytes = shutil.disk_usage(temp_dir).free
+    except (OSError, ValueError):
+        free_disk_bytes = None
+    if free_disk_bytes is not None and memmap_bytes > int(free_disk_bytes * 0.80):
+        return (
+            False,
+            "Skipping exact tail refinement because temporary storage demand "
+            f"({_format_bytes(memmap_bytes)}) is too large for '{temp_dir}' "
+            f"with {_format_bytes(free_disk_bytes)} free.",
+        )
+
+    available_bytes = _get_available_memory_bytes()
+    if available_bytes is not None:
+        one_worker_bytes = _estimate_exact_tail_reduction_bytes(
+            values_per_task,
+            config["risk"]["alpha"],
+        )
+        if one_worker_bytes > int(available_bytes * 0.70):
+            return (
+                False,
+                "Skipping exact tail refinement because estimated host reduction "
+                f"working set ({_format_bytes(one_worker_bytes)}) is too close to "
+                f"available memory ({_format_bytes(available_bytes)}).",
+            )
+
+    return True, None
+
+
+def _compute_tail_metrics_from_final_values(final_values, shortfall_floor, alpha, allow_inplace=False):
+    values = np.asarray(final_values, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return 0.0, 0.0
+
+    work = values if allow_inplace else np.array(values, dtype=np.float64, copy=True)
+
+    # Equivalent to np.percentile(..., 10) using linear interpolation while
+    # avoiding full-array sorting/copies for very large rows.
+    rank = 0.10 * (work.size - 1)
+    low_idx = int(np.floor(rank))
+    high_idx = int(np.ceil(rank))
+    if high_idx == low_idx:
+        work.partition(low_idx)
+        p10 = float(work[low_idx])
+    else:
+        work.partition(high_idx)
+        high_val = float(work[high_idx])
+        low_val = float(np.max(work[:high_idx]))
+        p10 = low_val + (high_val - low_val) * (rank - low_idx)
+
+    tail_count = max(1, int(np.ceil(alpha * work.size)))
+    work.partition(tail_count - 1)
+    worst = work[:tail_count]
+    shortfall_sum = float(np.sum(np.maximum(0.0, shortfall_floor - worst), dtype=np.float64))
+    cvar = shortfall_sum / float(tail_count)
     return p10, cvar
 
 
@@ -746,6 +838,40 @@ def _format_objective_for_summary(value, objective_mode):
     if objective_mode == "consensus":
         return f"{(-value):.6%} max regret (lower is better)"
     raise ValueError(f"Unsupported objective mode: {objective_mode}")
+
+
+def _fraction_display_decimals(fractions):
+    fractions = np.asarray(fractions, dtype=np.float64)
+    if fractions.size <= 1:
+        return 1
+    sorted_unique = np.unique(np.sort(fractions))
+    if sorted_unique.size <= 1:
+        return 1
+    min_step_pct = float(np.min(np.diff(sorted_unique)) * 100.0)
+    if not np.isfinite(min_step_pct) or min_step_pct <= 0:
+        return 1
+    scaled = min_step_pct
+    decimals = 0
+    while decimals < 6 and not np.isclose(scaled, np.round(scaled), rtol=0.0, atol=1e-9):
+        scaled *= 10.0
+        decimals += 1
+    return max(1, decimals)
+
+
+def _fraction_format_string(decimals):
+    return f"{{:19.{int(decimals)}f}}% | "
+
+
+def _build_table_display_indices(total_rows, max_rows=121):
+    if total_rows <= 0:
+        return []
+    if total_rows <= max_rows:
+        return list(range(total_rows))
+    stride = int(np.ceil(total_rows / max_rows))
+    indices = list(range(0, total_rows, stride))
+    if indices[-1] != total_rows - 1:
+        indices.append(total_rows - 1)
+    return indices
 
 
 def _score_strategy(final_net_worth, ruined, config):
@@ -1552,11 +1678,12 @@ def _compute_exact_tail_metrics_via_memmap(
         values.flush()
 
         def _compute_row_metrics(local_idx):
-            row = np.asarray(values[local_idx], dtype=np.float64)
+            row = values[local_idx]
             row_p10, row_cvar = _compute_tail_metrics_from_final_values(
                 row,
                 shortfall_floor,
                 risk["alpha"],
+                allow_inplace=True,
             )
             return local_idx, row_p10, row_cvar
 
@@ -1670,8 +1797,9 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config):
             log_score = primary["sum_log"] / n_sims
             ruin_probability = primary["ruin_count"] / n_sims
 
+            sample_matrix = primary["sample_matrix"]
             if gpu["cvar_mode"] == "streaming_near_exact":
-                p10, cvar = _derive_tail_metrics_from_samples(config, primary["sample_matrix"])
+                p10, cvar = _derive_tail_metrics_from_samples(config, sample_matrix)
             else:
                 p10 = np.zeros(n_fractions, dtype=np.float64)
                 cvar = np.zeros(n_fractions, dtype=np.float64)
@@ -1686,18 +1814,37 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config):
                 cvar,
             )
 
+            # Drop large sampled matrices before any exact/refine pass to avoid
+            # host-memory spikes after the primary GPU stage.
+            if sample_matrix is not None:
+                primary["sample_matrix"] = None
+                sample_matrix = None
+                gc.collect()
+
             exact_start = time.perf_counter()
             if gpu["cvar_mode"] == "exact_two_pass":
+                can_run_exact, exact_reason = _can_run_exact_tail_pass(config, n_fractions, n_sims)
+                if not can_run_exact:
+                    raise RuntimeError(
+                        "gpu.cvar_mode='exact_two_pass' requires full exact tail reduction, "
+                        f"but current resources are insufficient. {exact_reason}"
+                    )
                 all_indices = list(range(n_fractions))
-                exact_map = _compute_exact_tail_metrics_via_memmap(
-                    config,
-                    fractions_to_test,
-                    all_indices,
-                    horizon_months,
-                    chunk_size,
-                    fraction_tile_size,
-                    use_cuda_backend,
-                )
+                try:
+                    exact_map = _compute_exact_tail_metrics_via_memmap(
+                        config,
+                        fractions_to_test,
+                        all_indices,
+                        horizon_months,
+                        chunk_size,
+                        fraction_tile_size,
+                        use_cuda_backend,
+                    )
+                except (MemoryError, OSError) as exc:
+                    raise RuntimeError(
+                        "gpu.cvar_mode='exact_two_pass' failed during host-side tail reduction. "
+                        f"Original error: {exc}"
+                    ) from exc
                 _apply_exact_tail_metrics(diagnostics, exact_map, config)
             elif gpu["cvar_refine_pass"]:
                 refine_indices = _select_refine_candidate_indices(
@@ -1705,16 +1852,31 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config):
                     config["risk"]["max_ruin_probability"],
                     gpu["refine_top_k"],
                 )
-                exact_map = _compute_exact_tail_metrics_via_memmap(
-                    config,
-                    fractions_to_test,
-                    refine_indices,
-                    horizon_months,
-                    chunk_size,
-                    fraction_tile_size,
-                    use_cuda_backend,
-                )
-                _apply_exact_tail_metrics(diagnostics, exact_map, config)
+                if refine_indices:
+                    can_run_refine, refine_reason = _can_run_exact_tail_pass(
+                        config,
+                        len(refine_indices),
+                        n_sims,
+                    )
+                    if can_run_refine:
+                        try:
+                            exact_map = _compute_exact_tail_metrics_via_memmap(
+                                config,
+                                fractions_to_test,
+                                refine_indices,
+                                horizon_months,
+                                chunk_size,
+                                fraction_tile_size,
+                                use_cuda_backend,
+                            )
+                            _apply_exact_tail_metrics(diagnostics, exact_map, config)
+                        except (MemoryError, OSError) as exc:
+                            fallback_reasons.append(
+                                "Skipped exact tail refinement due host resource pressure: "
+                                f"{exc}"
+                            )
+                    elif refine_reason is not None:
+                        fallback_reasons.append(refine_reason)
             reduction_time_ms += (time.perf_counter() - exact_start) * 1000.0
             break
         except Exception as exc:
@@ -2060,6 +2222,8 @@ def run_monte_carlo_optimization(config=None, verbose=True):
         decision_grid["max_fraction"],
         decision_grid["num_points"],
     )
+    fraction_decimals = _fraction_display_decimals(fractions_to_test)
+    fraction_fmt = _fraction_format_string(fraction_decimals)
 
     primary_objective_mode = risk["objective_mode"]
     objective_label = _objective_label(primary_objective_mode)
@@ -2139,21 +2303,27 @@ def run_monte_carlo_optimization(config=None, verbose=True):
             f"{objective_label_for_table:>16}"
         )
         print("-" * 92)
-        for metrics in diagnostics:
+        display_indices = _build_table_display_indices(len(diagnostics))
+        for idx in display_indices:
+            metrics = diagnostics[idx]
             fraction = metrics["fraction_sold_today"]
-            if round(fraction * 100) % 10 == 0:
-                objective_display_value = metrics["score"]
-                objective_display_mode = primary_objective_mode
-                if primary_objective_mode == "consensus":
-                    objective_display_value = metrics["cvar_objective_score"]
-                    objective_display_mode = "cvar_shortfall"
-                objective_display = _format_objective_for_table(objective_display_value, objective_display_mode)
-                print(
-                    f"{fraction * 100:19.0f}% | "
-                    f"${metrics['expected_final_net_worth']:23,.0f} | "
-                    f"${metrics['cvar_shortfall']:16,.0f} | "
-                    f"{objective_display}"
-                )
+            objective_display_value = metrics["score"]
+            objective_display_mode = primary_objective_mode
+            if primary_objective_mode == "consensus":
+                objective_display_value = metrics["cvar_objective_score"]
+                objective_display_mode = "cvar_shortfall"
+            objective_display = _format_objective_for_table(objective_display_value, objective_display_mode)
+            print(
+                f"{fraction_fmt.format(fraction * 100.0)}"
+                f"${metrics['expected_final_net_worth']:23,.0f} | "
+                f"${metrics['cvar_shortfall']:16,.0f} | "
+                f"{objective_display}"
+            )
+        if len(display_indices) < len(diagnostics):
+            print(
+                f"... showing {len(display_indices)} evenly spaced rows out of "
+                f"{len(diagnostics):,} tested fractions."
+            )
 
     cvar_selection = _select_best_strategy(
         diagnostics,
@@ -2230,7 +2400,10 @@ def run_monte_carlo_optimization(config=None, verbose=True):
             print(f"Reduction time (ms):                   {execution['reduction_time_ms']:.1f}")
         print(f"Primary objective mode:                {primary_objective_mode}")
         print(f"Ruin probability guardrail:            <= {risk['max_ruin_probability']:.2%}")
-        print(f"Recommended sell-today fraction:        {result['recommended_fraction'] * 100:.1f}%")
+        print(
+            "Recommended sell-today fraction:        "
+            f"{result['recommended_fraction'] * 100:.{fraction_decimals}f}%"
+        )
         print(f"Expected final net worth:              ${result['expected_final_net_worth']:,.0f}")
         print(
             f"CVaR shortfall (worst {int(risk['alpha'] * 100)}%): "
@@ -2279,7 +2452,7 @@ def run_monte_carlo_optimization(config=None, verbose=True):
             print(f"  Mode:                                {mode}")
             print(
                 "  Recommended sell-today fraction:     "
-                f"{secondary_selection['recommended_fraction'] * 100:.1f}%"
+                f"{secondary_selection['recommended_fraction'] * 100:.{fraction_decimals}f}%"
             )
             print(
                 "  Objective score:                     "
@@ -2288,7 +2461,7 @@ def run_monte_carlo_optimization(config=None, verbose=True):
         print()
         print(
             "Decision framing: based on your belief distributions and risk settings, "
-            f"selling about {result['recommended_fraction'] * 100:.1f}% today is the "
+            f"selling about {result['recommended_fraction'] * 100:.{fraction_decimals}f}% today is the "
             "best one-time action under the configured objective and guardrail."
         )
 

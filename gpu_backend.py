@@ -56,10 +56,10 @@ def query_device_metadata(device_id):
 
 def load_cuda_extension():
     try:
-        return importlib.import_module("crash_prep_cuda")
+        return importlib.import_module("blackswan_cuda")
     except Exception as exc:
         raise GpuBackendError(
-            "CUDA extension 'crash_prep_cuda' is unavailable. "
+            "CUDA extension 'blackswan_cuda' is unavailable. "
             "Build it first with the provided CMake/pyproject config. "
             f"Original import error: {exc!r}"
         ) from exc

@@ -6,7 +6,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from crash_prep_optimizer import run_monte_carlo_optimization
+from blackswan import run_monte_carlo_optimization
 
 
 def run_case(name, config):

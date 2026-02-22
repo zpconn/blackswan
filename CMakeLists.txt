@@ -14,7 +14,7 @@ endif()
 
 set(PYBIND11_FINDPYTHON ON)
 
-project(crash_prep_cuda LANGUAGES CXX CUDA)
+project(blackswan_cuda LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,23 +29,23 @@ find_package(pybind11 CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
 pybind11_add_module(
-    crash_prep_cuda
+    blackswan_cuda
     src/cuda/bindings.cpp
     src/cuda/sim_kernel.cu
 )
 
-target_include_directories(crash_prep_cuda PRIVATE src/cuda)
-target_link_libraries(crash_prep_cuda PRIVATE CUDA::cudart)
+target_include_directories(blackswan_cuda PRIVATE src/cuda)
+target_link_libraries(blackswan_cuda PRIVATE CUDA::cudart)
 
 target_compile_options(
-    crash_prep_cuda
+    blackswan_cuda
     PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
 )
 
 install(
-    TARGETS crash_prep_cuda
+    TARGETS blackswan_cuda
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
     ARCHIVE DESTINATION .

@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import crash_prep_optimizer as optimizer
+import blackswan as optimizer
 
 
 def _base_config():
@@ -249,6 +249,47 @@ def test_tail_reduction_worker_resolution_uses_cpu_count_when_memory_allows(monk
     assert workers == 12
 
 
+def test_tail_metric_helper_matches_reference():
+    rng = np.random.default_rng(7)
+    final_values = rng.normal(loc=2_000_000.0, scale=250_000.0, size=25_000).astype(np.float64)
+    floor = 2_200_000.0
+    alpha = 0.10
+
+    expected_p10 = float(np.percentile(final_values, 10))
+    expected_shortfall = np.maximum(0.0, floor - final_values)
+    expected_cvar = optimizer._compute_cvar(expected_shortfall, alpha)
+
+    p10, cvar = optimizer._compute_tail_metrics_from_final_values(final_values, floor, alpha)
+    assert math.isclose(p10, expected_p10, rel_tol=1e-12, abs_tol=1e-10)
+    assert math.isclose(cvar, expected_cvar, rel_tol=1e-12, abs_tol=1e-10)
+
+    inplace_values = final_values.copy()
+    p10_inplace, cvar_inplace = optimizer._compute_tail_metrics_from_final_values(
+        inplace_values,
+        floor,
+        alpha,
+        allow_inplace=True,
+    )
+    assert math.isclose(p10_inplace, expected_p10, rel_tol=1e-12, abs_tol=1e-10)
+    assert math.isclose(cvar_inplace, expected_cvar, rel_tol=1e-12, abs_tol=1e-10)
+
+
+def test_fraction_display_decimals_tracks_grid_step():
+    fractions = np.linspace(0.20, 0.30, 1001)
+    assert optimizer._fraction_display_decimals(fractions) == 2
+
+    coarse = np.linspace(0.0, 1.0, 51)
+    assert optimizer._fraction_display_decimals(coarse) == 1
+
+
+def test_build_table_display_indices_samples_evenly():
+    indices = optimizer._build_table_display_indices(1001, max_rows=121)
+    assert indices[0] == 0
+    assert indices[-1] == 1000
+    assert len(indices) <= 121
+    assert len(indices) > 2
+
+
 def test_gpu_extension_fallback_to_cpu_when_unavailable(monkeypatch):
     def fake_load_failure():
         raise optimizer.gpu_backend.GpuBackendError("forced missing extension for test")
@@ -361,3 +402,47 @@ def test_cuda_oom_backoff_retries_with_smaller_chunk(monkeypatch):
     assert result["execution"]["chunk_size_used"] < 1_000
     assert "backoff" in result["execution"]["fallback_reason"].lower()
     assert calls["count"] >= 2
+
+
+def test_refine_pass_skips_exact_when_resource_guard_blocks(monkeypatch):
+    monkeypatch.setattr(
+        optimizer,
+        "_can_run_exact_tail_pass",
+        lambda config, subset_size, values_per_task: (False, "resource guard triggered for test"),
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("_compute_exact_tail_metrics_via_memmap should not be called when guard blocks refine")
+
+    monkeypatch.setattr(optimizer, "_compute_exact_tail_metrics_via_memmap", fail_if_called)
+
+    cfg = _base_config()
+    cfg["gpu"] = {
+        "enabled": True,
+        "prefer_cuda_extension": False,
+        "scenario_chunk_size": 300,
+        "sample_size": 500,
+        "cvar_mode": "streaming_near_exact",
+        "cvar_refine_pass": True,
+        "refine_top_k": 3,
+    }
+    result = optimizer.run_monte_carlo_optimization(config=cfg, verbose=False)
+    assert "resource guard triggered for test" in result["execution"]["fallback_reason"]
+
+
+def test_exact_two_pass_fails_fast_when_resource_guard_blocks(monkeypatch):
+    monkeypatch.setattr(
+        optimizer,
+        "_can_run_exact_tail_pass",
+        lambda config, subset_size, values_per_task: (False, "insufficient resources for test"),
+    )
+
+    cfg = _base_config()
+    cfg["gpu"] = {
+        "enabled": True,
+        "prefer_cuda_extension": False,
+        "cvar_mode": "exact_two_pass",
+        "scenario_chunk_size": 300,
+    }
+    with pytest.raises(RuntimeError, match="insufficient resources for test"):
+        optimizer.run_monte_carlo_optimization(config=cfg, verbose=False)
