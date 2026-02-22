@@ -86,6 +86,8 @@ def test_validate_config_rejects_invalid_parallel_settings(override):
         {"gpu": {"scenario_chunk_size": 0}},
         {"gpu": {"precision_mode": "bad_mode"}},
         {"gpu": {"cvar_mode": "bad_mode"}},
+        {"gpu": {"reduction_workers": 0}},
+        {"gpu": {"reduction_workers": True}},
     ],
 )
 def test_validate_config_rejects_invalid_gpu_settings(override):
@@ -214,6 +216,37 @@ def test_parallel_can_be_forced_single_worker():
     result = optimizer.run_monte_carlo_optimization(config=cfg, verbose=False)
     assert result["execution"]["mode"] == "single"
     assert result["execution"]["workers_used"] == 1
+
+
+def test_tail_reduction_worker_resolution_respects_explicit_override():
+    config = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {"gpu": {"reduction_workers": 8}},
+    )
+    workers = optimizer._resolve_tail_reduction_workers(config, task_count=3, values_per_task=10_000_000)
+    assert workers == 3
+
+
+def test_tail_reduction_worker_resolution_caps_with_memory_budget(monkeypatch):
+    monkeypatch.setattr(optimizer.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(optimizer, "_get_available_memory_bytes", lambda: 4 * 1024 * 1024 * 1024)
+    config = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {"gpu": {"reduction_workers": None}},
+    )
+    workers = optimizer._resolve_tail_reduction_workers(config, task_count=12, values_per_task=10_000_000)
+    assert workers == 1
+
+
+def test_tail_reduction_worker_resolution_uses_cpu_count_when_memory_allows(monkeypatch):
+    monkeypatch.setattr(optimizer.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(optimizer, "_get_available_memory_bytes", lambda: 32 * 1024 * 1024 * 1024)
+    config = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {"gpu": {"reduction_workers": None}},
+    )
+    workers = optimizer._resolve_tail_reduction_workers(config, task_count=12, values_per_task=10_000_000)
+    assert workers == 12
 
 
 def test_gpu_extension_fallback_to_cpu_when_unavailable(monkeypatch):

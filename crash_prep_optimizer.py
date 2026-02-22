@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
         "prefer_cuda_extension": True,
         "device_scenario_generation": True,
         "refine_top_k": 5,
+        "reduction_workers": None,
         "exact_temp_dir": None,
         "min_chunk_size": 32_768,
         "oom_backoff_factor": 0.5,
@@ -276,6 +277,11 @@ def validate_config(config):
         raise ValueError("gpu.device_scenario_generation must be a bool.")
     if gpu["refine_top_k"] <= 0:
         raise ValueError("gpu.refine_top_k must be > 0.")
+    if gpu["reduction_workers"] is not None:
+        if isinstance(gpu["reduction_workers"], bool) or not isinstance(gpu["reduction_workers"], int):
+            raise ValueError("gpu.reduction_workers must be an int > 0 or None.")
+        if gpu["reduction_workers"] <= 0:
+            raise ValueError("gpu.reduction_workers must be > 0 or None.")
     if gpu["exact_temp_dir"] is not None and not isinstance(gpu["exact_temp_dir"], str):
         raise ValueError("gpu.exact_temp_dir must be a string path or None.")
     if gpu["min_chunk_size"] <= 0:
@@ -339,6 +345,102 @@ def _compute_cvar(losses, alpha):
     tail_count = max(1, int(np.ceil(alpha * losses.size)))
     tail = np.partition(losses, losses.size - tail_count)[-tail_count:]
     return float(np.mean(tail))
+
+
+def _read_positive_int_from_file(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except OSError:
+        return None
+
+    if not raw or raw == "max":
+        return None
+
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+
+    # cgroup "no limit" sentinels are extremely large and should be ignored.
+    if value <= 0 or value >= (1 << 60):
+        return None
+    return value
+
+
+def _get_cgroup_available_memory_bytes():
+    # cgroup v2 files
+    limit = _read_positive_int_from_file("/sys/fs/cgroup/memory.max")
+    if limit is not None:
+        usage = _read_positive_int_from_file("/sys/fs/cgroup/memory.current")
+        if usage is None:
+            return limit
+        return max(0, limit - usage)
+
+    # cgroup v1 files
+    limit = _read_positive_int_from_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if limit is not None:
+        usage = _read_positive_int_from_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        if usage is None:
+            return limit
+        return max(0, limit - usage)
+
+    return None
+
+
+def _get_available_memory_bytes():
+    meminfo_available = None
+    if os.name == "posix":
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            meminfo_available = int(parts[1]) * 1024
+                        break
+        except Exception:
+            meminfo_available = None
+
+    cgroup_available = _get_cgroup_available_memory_bytes()
+    if meminfo_available is None:
+        return cgroup_available
+    if cgroup_available is None:
+        return meminfo_available
+    return min(meminfo_available, cgroup_available)
+
+
+def _resolve_tail_reduction_workers(config, task_count, values_per_task):
+    if task_count <= 1:
+        return 1
+
+    gpu = config["gpu"]
+    requested = gpu["reduction_workers"]
+    if requested is not None:
+        return max(1, min(int(requested), task_count))
+
+    cpu_count = os.cpu_count() or 1
+    workers = min(task_count, cpu_count)
+    if values_per_task <= 0:
+        return max(1, workers)
+
+    # Keep auto mode conservative because percentile/CVaR can allocate multiple
+    # temporary arrays per worker for large rows.
+    available_bytes = _get_available_memory_bytes()
+    if available_bytes is not None:
+        bytes_per_worker = int(values_per_task) * 64
+        if bytes_per_worker > 0:
+            budget_bytes = int(available_bytes * 0.25)
+            workers_by_mem = max(1, budget_bytes // bytes_per_worker)
+            workers = min(workers, workers_by_mem)
+    return max(1, workers)
+
+
+def _compute_tail_metrics_from_final_values(final_values, shortfall_floor, alpha):
+    p10 = float(np.percentile(final_values, 10))
+    shortfall = np.maximum(0.0, shortfall_floor - final_values)
+    cvar = float(_compute_cvar(shortfall, alpha))
+    return p10, cvar
 
 
 def _generate_universe(config):
@@ -1354,13 +1456,30 @@ def _derive_tail_metrics_from_samples(config, sample_matrix):
         shortfall_floor = portfolio["initial_portfolio"]
 
     n_fractions = sample_matrix.shape[0]
+    worker_count = _resolve_tail_reduction_workers(config, n_fractions, sample_matrix.shape[1])
     p10 = np.zeros(n_fractions, dtype=np.float64)
     cvar = np.zeros(n_fractions, dtype=np.float64)
-    for idx in range(n_fractions):
-        sampled_final = sample_matrix[idx]
-        p10[idx] = float(np.percentile(sampled_final, 10))
-        sampled_shortfall = np.maximum(0.0, shortfall_floor - sampled_final)
-        cvar[idx] = _compute_cvar(sampled_shortfall, risk["alpha"])
+
+    def _compute_row_metrics(idx):
+        sampled_final = np.asarray(sample_matrix[idx], dtype=np.float64)
+        row_p10, row_cvar = _compute_tail_metrics_from_final_values(
+            sampled_final,
+            shortfall_floor,
+            risk["alpha"],
+        )
+        return idx, row_p10, row_cvar
+
+    if worker_count == 1:
+        for idx in range(n_fractions):
+            _, row_p10, row_cvar = _compute_row_metrics(idx)
+            p10[idx] = row_p10
+            cvar[idx] = row_cvar
+        return p10, cvar
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for idx, row_p10, row_cvar in executor.map(_compute_row_metrics, range(n_fractions)):
+            p10[idx] = row_p10
+            cvar[idx] = row_cvar
     return p10, cvar
 
 
@@ -1387,6 +1506,7 @@ def _compute_exact_tail_metrics_via_memmap(
 
     subset_fractions = np.asarray([fractions_to_test[idx] for idx in fraction_indices], dtype=np.float64)
     subset_n = subset_fractions.size
+    reduction_workers = _resolve_tail_reduction_workers(config, subset_n, n_sims)
     tile_size = min(fraction_tile_size, subset_n)
     temp_dir = gpu["exact_temp_dir"] or tempfile.gettempdir()
 
@@ -1431,12 +1551,24 @@ def _compute_exact_tail_metrics_via_memmap(
             write_pos += chunk_n
         values.flush()
 
-        for local_idx, global_idx in enumerate(fraction_indices):
+        def _compute_row_metrics(local_idx):
             row = np.asarray(values[local_idx], dtype=np.float64)
-            p10 = float(np.percentile(row, 10))
-            shortfall = np.maximum(0.0, shortfall_floor - row)
-            cvar = float(_compute_cvar(shortfall, risk["alpha"]))
-            exact_map[int(global_idx)] = (p10, cvar)
+            row_p10, row_cvar = _compute_tail_metrics_from_final_values(
+                row,
+                shortfall_floor,
+                risk["alpha"],
+            )
+            return local_idx, row_p10, row_cvar
+
+        if reduction_workers == 1:
+            for local_idx, global_idx in enumerate(fraction_indices):
+                _, row_p10, row_cvar = _compute_row_metrics(local_idx)
+                exact_map[int(global_idx)] = (row_p10, row_cvar)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=reduction_workers) as executor:
+                for local_idx, row_p10, row_cvar in executor.map(_compute_row_metrics, range(subset_n)):
+                    global_idx = int(fraction_indices[local_idx])
+                    exact_map[global_idx] = (row_p10, row_cvar)
 
         del values
     finally:

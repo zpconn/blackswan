@@ -202,6 +202,7 @@ DEFAULT_CONFIG = {
         "prefer_cuda_extension": True,
         "device_scenario_generation": True,
         "refine_top_k": 5,
+        "reduction_workers": None,
         "exact_temp_dir": None,
         "min_chunk_size": 32_768,
         "oom_backoff_factor": 0.5,
@@ -239,6 +240,7 @@ Supported distribution specs for beliefs:
 - `gpu.cvar_mode="streaming_near_exact"` uses bounded-memory tail estimation from sampled scenarios.
 - `gpu.cvar_mode="exact_two_pass"` performs an exact second pass using temporary memmap storage.
 - `gpu.cvar_refine_pass=True` recomputes exact tail metrics for top candidates in streaming mode.
+- `gpu.reduction_workers` controls CPU parallelism for tail-reduction work (`None` = auto, memory-aware).
 - `gpu.min_chunk_size` and `gpu.oom_backoff_factor` control automatic CUDA OOM retry behavior.
 
 ## Objective Modes
@@ -377,6 +379,14 @@ Check:
 
 `gpu.cvar_mode="exact_two_pass"` writes temporary memmap files to compute exact tails.  
 Use `gpu.exact_temp_dir` to point at a fast disk with enough free space.
+
+### End-of-run CPU bottleneck during tail reduction
+
+Tail metrics (percentile/CVaR) are reduced on CPU. If one core appears saturated:
+
+- leave `gpu.reduction_workers=None` (auto) or set it explicitly (for example, `8` or `12`)
+- keep `gpu.cvar_mode="streaming_near_exact"` with `gpu.cvar_refine_pass=True` for faster near-exact runs
+- use `gpu.cvar_mode="exact_two_pass"` only when full exact tails are required
 
 ### `simulation.horizon_months is shorter than sampled crash windows`
 
