@@ -13,14 +13,15 @@ It simulates many possible futures (market crashes, recovery paths, layoffs, cas
 3. [How It Works](#how-it-works)
 4. [Installation](#installation)
 5. [Quick Start](#quick-start)
-6. [Configuration](#configuration)
-7. [Objective Modes](#objective-modes)
-8. [Parallel Execution Model](#parallel-execution-model)
-9. [Result Schema](#result-schema)
-10. [Troubleshooting](#troubleshooting)
-11. [Testing](#testing)
-12. [Repository Layout](#repository-layout)
-13. [Limitations and Assumptions](#limitations-and-assumptions)
+6. [Blackswan TUI (Charm Stack)](#blackswan-tui-charm-stack)
+7. [Configuration](#configuration)
+8. [Objective Modes](#objective-modes)
+9. [Parallel Execution Model](#parallel-execution-model)
+10. [Result Schema](#result-schema)
+11. [Troubleshooting](#troubleshooting)
+12. [Testing](#testing)
+13. [Repository Layout](#repository-layout)
+14. [Limitations and Assumptions](#limitations-and-assumptions)
 
 ## What This Model Solves
 
@@ -125,6 +126,43 @@ Use single quotes around the whole `-c` script and double quotes inside Python:
 ```bash
 . .venv/bin/activate && python -u -c 'from blackswan import run_monte_carlo_optimization; r = run_monte_carlo_optimization(config={"simulation":{"n_sims":5_000_001,"parallel_enabled":True,"parallel_workers":None},"risk":{"objective_mode":"consensus","max_ruin_probability":0.005}}, verbose=True); print("\nExecution metadata:", r["execution"])'
 ```
+
+
+## Blackswan TUI (Charm Stack)
+
+`blackswan-tui` is a local, interactive terminal cockpit built with the Charm stack (`bubbletea`, `bubbles`, `lipgloss`).
+It launches a local Python service bridge, streams live execution telemetry (including GPU/CPU progress events), and lets you run/cancel jobs without leaving the terminal.
+
+### TUI Prerequisites
+
+- Go `1.22+`
+- Python virtualenv at `.venv` with project dependencies installed
+- Optional CUDA extension if you want `gpu.prefer_cuda_extension=True`
+
+### Run the TUI
+
+```bash
+. .venv/bin/activate
+go run ./cmd/blackswan-tui
+```
+
+### Core TUI Controls
+
+- `ctrl+r`: start run with current JSON config
+- `ctrl+x`: cancel active run
+- `tab`: switch focus between config editor and history pane
+- `enter`: load selected historical bundle
+- `ctrl+l`: clear telemetry pane
+- `?`: toggle help bar
+- `q` or `ctrl+c`: quit
+
+### TUI Architecture
+
+- `cmd/blackswan-tui`: Go entrypoint and Bubble Tea program
+- `internal/app`: UI model, layout, key handling, and event wiring
+- `internal/service`: manager that starts `python_service/blackswan_service.py` and talks over authenticated local HTTP/SSE
+- `python_service/blackswan_service.py`: run orchestration service (`/runs`, `/runs/{id}`, `/runs/{id}/stream`, `/runs/{id}/cancel`)
+- `runs/`: persisted run bundles (`config.json`, `result.json`, `events.json`, `summary.json`)
 
 ## Configuration
 
@@ -418,6 +456,11 @@ Current tests cover:
 ## Repository Layout
 
 - `blackswan.py`: simulation engine and optimizer
+- `python_service/blackswan_service.py`: local authenticated HTTP/SSE bridge for UI clients
+- `cmd/blackswan-tui/main.go`: Charm-based TUI entrypoint
+- `internal/app/`: Bubble Tea model and UI rendering
+- `internal/service/`: Go process + HTTP/SSE client manager
+- `internal/storage/`: persisted run bundle management under `runs/`
 - `gpu_backend.py`: CUDA extension integration and device metadata
 - `CMakeLists.txt`: native extension build configuration
 - `src/cuda/`: C++/CUDA kernel and pybind bindings

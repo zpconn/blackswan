@@ -446,3 +446,28 @@ def test_exact_two_pass_fails_fast_when_resource_guard_blocks(monkeypatch):
     }
     with pytest.raises(RuntimeError, match="insufficient resources for test"):
         optimizer.run_monte_carlo_optimization(config=cfg, verbose=False)
+
+
+def test_progress_callback_emits_core_lifecycle_events():
+    cfg = _base_config()
+    cfg["decision_grid"]["num_points"] = 7
+
+    events = []
+
+    def progress_callback(event, payload):
+        events.append((event, payload))
+
+    result = optimizer.run_monte_carlo_optimization(
+        config=cfg,
+        verbose=False,
+        progress_callback=progress_callback,
+    )
+
+    _assert_core_result_shape(result, expected_points=cfg["decision_grid"]["num_points"])
+
+    event_names = [name for name, _ in events]
+    assert "run_start" in event_names
+    assert "run_complete" in event_names
+    assert "cpu_fraction_eval_start" in event_names
+    assert "cpu_fraction_eval_complete" in event_names
+    assert any(name == "cpu_fraction_eval_progress" for name in event_names)

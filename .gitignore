@@ -1,3 +1,13 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Go
+bin/
+dist/
+*.test
+
+# Runtime artifacts
+runs/
