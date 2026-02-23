@@ -11,7 +11,9 @@ Blackswan is a massively parallel GPU-accelerated Monte Carlo decision engine fo
 
 It models crash timing/severity, layoffs, cash burn, taxes, and monthly saving behavior across many simulated futures, then recommends the sell-today fraction that best matches your selected objective under a ruin-probability guardrail. On top-flight consumer hardware, a single blackswan run can project 1,000 different sell percentages forward in time each against hundreds of millions of possible future 10+ year-long trajectories in just 5-10m, performing tens of trillions of month-to-month update simulations. It ships with an interactive graphical terminal user interface with live telemetry.
 
-All code was written by `codex-5.3-xhigh` with human guidance. It is the author's belief that no human, no matter how specialized, could have written a computation and system of this complexity manually during the same timeframe. This sheer volume of scientific computational decision support has never been available before on such a bespoke basis. `blackswan` was developed incrementally, in step-function swells of increasing sophistication and parallelism. During development, correctness and integrity were preserved across such increments by constantly re-running a library of curated simulation configurations and results.
+All code was written by `codex-5.3-xhigh` with human guidance. It is the author's belief that no human, no matter how specialized, could have written a computation and system of this complexity manually during the same timeframe. This sheer volume of scientific computational decision support has never been available before on such a bespoke basis.
+
+Combining this level of computational and system nuance with such speed required a somewhat unique development style. `blackswan` was developed incrementally, in deliberately chosen step-function swells of increasing sophistication and parallelism. During development, correctness and integrity were preserved across such increments by constantly re-running a library of curated simulation configurations and results.
 
 ## Table of Contents
 
