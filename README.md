@@ -13,7 +13,7 @@ It models crash timing/severity, layoffs, cash burn, taxes, and monthly saving b
 
 All code was written by `codex-5.3-xhigh` with human guidance. It is the author's belief that no human, no matter how specialized, could have written a computation and system of this complexity manually during the same timeframe. This sheer volume of scientific computational decision support has never been available before on such a bespoke basis.
 
-Combining this level of computational and system nuance with such speed required a somewhat unique development style. `blackswan` was developed incrementally, in deliberately chosen step-function swells of increasing sophistication and parallelism. During development, correctness and integrity were preserved across such increments by constantly re-running a library of curated simulation configurations and results.
+Combining this level of computational and system nuance with such development speed required a somewhat unique development style. `blackswan` was developed incrementally, in deliberately chosen step-function swells of increasing sophistication and parallelism. During development, correctness and integrity were preserved across such increments by constantly re-running a library of curated simulation configurations and results.
 
 ## Table of Contents
 
