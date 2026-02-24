@@ -8,6 +8,8 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -35,34 +38,49 @@ var (
 
 var (
 	headerStyle = lipgloss.NewStyle().
-		Padding(0, 1).
-		Bold(true).
-		Foreground(accentPrimary)
+			Padding(0, 1).
+			Bold(true).
+			Foreground(accentPrimary)
 
 	subHeaderStyle = lipgloss.NewStyle().
-		Foreground(mutedText)
+			Foreground(mutedText)
 
 	statusStyle = lipgloss.NewStyle().
-		Foreground(accentSecondary).
-		Bold(true)
+			Foreground(accentSecondary).
+			Bold(true)
 
 	errorStyle = lipgloss.NewStyle().
-		Foreground(warningText).
-		Bold(true)
+			Foreground(warningText).
+			Bold(true)
 
 	panelTitleStyle = lipgloss.NewStyle().
-		Foreground(accentPrimary).
-		Bold(true)
+			Foreground(accentPrimary).
+			Bold(true)
 
 	panelStyle = lipgloss.NewStyle().
-		Background(panelBG).
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(panelBorder).
-		Padding(0, 1)
+			Background(panelBG).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(panelBorder).
+			Padding(0, 1)
 
 	helpStyle = lipgloss.NewStyle().
-		Foreground(mutedText)
+			Foreground(mutedText)
+
+	jsonKeyStyle = lipgloss.NewStyle().
+			Foreground(accentPrimary).
+			Bold(true)
+
+	jsonObjectKeyStyle = lipgloss.NewStyle().
+				Foreground(accentSecondary).
+				Bold(true)
+
+	historySelectedLineStyle = lipgloss.NewStyle().
+					Foreground(accentPrimary).
+					Background(lipgloss.Color("#16323D")).
+					Bold(true)
 )
+
+var jsonKeyPattern = regexp.MustCompile(`"([^"\\]|\\.)*"\s*:`)
 
 type defaultsLoadedMsg struct {
 	defaults map[string]any
@@ -72,6 +90,13 @@ type defaultsLoadedMsg struct {
 type historyLoadedMsg struct {
 	items []storage.RunSummary
 	err   error
+}
+
+type configFileLoadedMsg struct {
+	path   string
+	config map[string]any
+	text   string
+	err    error
 }
 
 type runStartedMsg struct {
@@ -129,8 +154,9 @@ type systemMetricsSnapshot struct {
 }
 
 type systemMetricsMsg struct {
-	snapshot systemMetricsSnapshot
-	err      error
+	snapshot  systemMetricsSnapshot
+	sampledAt time.Time
+	err       error
 }
 
 type focusPane int
@@ -142,25 +168,42 @@ const (
 	paneHistory
 )
 
+const (
+	metricsPollInterval      = 1200 * time.Millisecond
+	maxMetricsCatchupSamples = 12
+)
+
+type ModelOptions struct {
+	InitialConfigJSON string
+	InitialConfigPath string
+}
+
 type Model struct {
 	service *service.Manager
 	store   *storage.Store
 
-	ready bool
-	width int
+	ready  bool
+	width  int
 	height int
 
-	configEditor textarea.Model
-	telemetry    viewport.Model
-	results      viewport.Model
-	history      viewport.Model
-	spinner      spinner.Model
+	configEditor    textarea.Model
+	configPathInput textinput.Model
+	telemetry       viewport.Model
+	results         viewport.Model
+	history         viewport.Model
+	spinner         spinner.Model
 
-	focusPane   focusPane
-	showHelp    bool
+	focusPane focusPane
+	showHelp  bool
 
-	statusText string
-	errorText  string
+	statusText             string
+	errorText              string
+	configPinned           bool
+	showConfigPathPrompt   bool
+	lastConfigPath         string
+	configPathChoices      []string
+	configPathChoiceCursor int
+	configPathChoiceOffset int
 
 	running            bool
 	currentRunID       string
@@ -176,28 +219,33 @@ type Model struct {
 	finalizingSince    time.Time
 	pendingTerminal    *service.RunStatus
 
-	historyItems  []storage.RunSummary
-	historyCursor int
+	historyItems            []storage.RunSummary
+	historyCursor           int
+	historyCursorTopLine    int
+	historyCursorBottomLine int
+	historyRenderedLines    int
 
-	telemetryEntries []string
-	telemetryLines   []string
+	telemetryEntries    []string
+	telemetryLines      []string
 	telemetryAutoFollow bool
 
-	cpuUsagePct    float64
-	memUsagePct    float64
-	memAvailable   bool
-	gpuUsagePct    float64
-	gpuMemUsagePct float64
-	gpuAvailable   bool
-	gpuLabel       string
-	gpuNote        string
-	gpuProbeEnabled bool
-	cpuLastTotal   uint64
-	cpuLastIdle    uint64
-	cpuHasBaseline bool
-	cpuHistory     []float64
-	memHistory     []float64
-	gpuHistory     []float64
+	cpuUsagePct         float64
+	memUsagePct         float64
+	memAvailable        bool
+	gpuUsagePct         float64
+	gpuMemUsagePct      float64
+	gpuAvailable        bool
+	gpuLabel            string
+	gpuNote             string
+	gpuProbeEnabled     bool
+	cpuLastTotal        uint64
+	cpuLastIdle         uint64
+	cpuHasBaseline      bool
+	cpuHistory          []float64
+	memHistory          []float64
+	gpuHistory          []float64
+	terminalFocused     bool
+	lastMetricsSampleAt time.Time
 
 	configPanelW int
 	configPanelH int
@@ -212,6 +260,10 @@ type Model struct {
 }
 
 func NewModel(svc *service.Manager, store *storage.Store) Model {
+	return NewModelWithOptions(svc, store, ModelOptions{})
+}
+
+func NewModelWithOptions(svc *service.Manager, store *storage.Store, opts ModelOptions) Model {
 	cfgEditor := textarea.New()
 	cfgEditor.CharLimit = 2_000_000
 	cfgEditor.Prompt = ""
@@ -234,31 +286,50 @@ func NewModel(svc *service.Manager, store *storage.Store) Model {
 	spin.Spinner = spinner.MiniDot
 	spin.Style = lipgloss.NewStyle().Foreground(accentSecondary)
 
-	return Model{
-		service:      svc,
-		store:        store,
-		configEditor: cfgEditor,
-		telemetry:    telemetry,
-		results:      results,
-		history:      history,
-		spinner:      spin,
-		focusPane:    paneConfig,
-		showHelp:     true,
-		statusText:   "Service connected. Loading defaults...",
-		gpuProbeEnabled: true,
-		gpuNote:      "probing...",
+	pathInput := textinput.New()
+	pathInput.Prompt = "> "
+	pathInput.Placeholder = "./config.json"
+	pathInput.CharLimit = 2048
+	pathInput.Width = 70
+
+	model := Model{
+		service:             svc,
+		store:               store,
+		configEditor:        cfgEditor,
+		configPathInput:     pathInput,
+		telemetry:           telemetry,
+		results:             results,
+		history:             history,
+		spinner:             spin,
+		focusPane:           paneConfig,
+		showHelp:            true,
+		statusText:          "Service connected. Loading defaults...",
+		gpuProbeEnabled:     true,
+		gpuNote:             "probing...",
 		telemetryAutoFollow: true,
-		configPanelW: 74,
-		configPanelH: 22,
-		resourceW:    54,
-		resourceH:    8,
-		telemetryW:   54,
-		telemetryH:   22,
-		resultsW:     54,
-		resultsH:     16,
-		historyW:     44,
-		historyH:     16,
+		configPanelW:        74,
+		configPanelH:        22,
+		resourceW:           54,
+		resourceH:           8,
+		telemetryW:          54,
+		telemetryH:          22,
+		resultsW:            54,
+		resultsH:            16,
+		historyW:            44,
+		historyH:            16,
+		terminalFocused:     true,
 	}
+	if strings.TrimSpace(opts.InitialConfigJSON) != "" {
+		model.configEditor.SetValue(opts.InitialConfigJSON)
+		model.configPinned = true
+		model.lastConfigPath = strings.TrimSpace(opts.InitialConfigPath)
+		if model.lastConfigPath != "" {
+			model.statusText = "Service connected. Loaded startup config from " + model.lastConfigPath
+		} else {
+			model.statusText = "Service connected. Loaded startup config."
+		}
+	}
+	return model
 }
 
 func (m Model) Init() tea.Cmd {
@@ -284,6 +355,184 @@ func loadHistoryCmd(store *storage.Store) tea.Cmd {
 		items, err := store.List(200)
 		return historyLoadedMsg{items: items, err: err}
 	}
+}
+
+func loadConfigFileCmd(path string) tea.Cmd {
+	requestedPath := strings.TrimSpace(path)
+	return func() tea.Msg {
+		cfg, resolvedPath, err := LoadConfigFile(requestedPath)
+		if err != nil {
+			return configFileLoadedMsg{path: requestedPath, err: err}
+		}
+		text, err := FormatConfigJSON(cfg)
+		if err != nil {
+			return configFileLoadedMsg{path: resolvedPath, err: err}
+		}
+		return configFileLoadedMsg{
+			path:   resolvedPath,
+			config: cfg,
+			text:   text,
+		}
+	}
+}
+
+func listJSONFilesInDir(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if name == "" {
+			continue
+		}
+		if strings.EqualFold(filepath.Ext(name), ".json") {
+			files = append(files, name)
+		}
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		li := strings.ToLower(files[i])
+		lj := strings.ToLower(files[j])
+		if li == lj {
+			return files[i] < files[j]
+		}
+		return li < lj
+	})
+	return files, nil
+}
+
+func (m *Model) configPathListVisibleRows() int {
+	if m.height <= 0 {
+		return 6
+	}
+	return clampInt(m.height/6, 4, 10)
+}
+
+func (m *Model) ensureConfigPathChoiceVisible() {
+	if len(m.configPathChoices) == 0 {
+		m.configPathChoiceCursor = 0
+		m.configPathChoiceOffset = 0
+		return
+	}
+
+	m.configPathChoiceCursor = clampInt(m.configPathChoiceCursor, 0, len(m.configPathChoices)-1)
+	visibleRows := maxInt(1, m.configPathListVisibleRows())
+	maxOffset := maxInt(0, len(m.configPathChoices)-visibleRows)
+	m.configPathChoiceOffset = clampInt(m.configPathChoiceOffset, 0, maxOffset)
+
+	if m.configPathChoiceCursor < m.configPathChoiceOffset {
+		m.configPathChoiceOffset = m.configPathChoiceCursor
+	}
+	if m.configPathChoiceCursor >= m.configPathChoiceOffset+visibleRows {
+		m.configPathChoiceOffset = m.configPathChoiceCursor - visibleRows + 1
+	}
+	m.configPathChoiceOffset = clampInt(m.configPathChoiceOffset, 0, maxOffset)
+}
+
+func (m *Model) setConfigPathChoiceCursor(cursor int) {
+	if len(m.configPathChoices) == 0 {
+		m.configPathChoiceCursor = 0
+		m.configPathChoiceOffset = 0
+		return
+	}
+	m.configPathChoiceCursor = clampInt(cursor, 0, len(m.configPathChoices)-1)
+	m.ensureConfigPathChoiceVisible()
+	selected := m.configPathChoices[m.configPathChoiceCursor]
+	m.configPathInput.SetValue(selected)
+	m.configPathInput.CursorEnd()
+}
+
+func (m *Model) syncConfigPathChoiceToInput() {
+	if len(m.configPathChoices) == 0 {
+		return
+	}
+	input := strings.TrimSpace(m.configPathInput.Value())
+	if input == "" {
+		return
+	}
+
+	inputBase := filepathBase(input)
+	for idx, choice := range m.configPathChoices {
+		if choice == input || choice == inputBase {
+			m.configPathChoiceCursor = idx
+			m.ensureConfigPathChoiceVisible()
+			return
+		}
+	}
+}
+
+func (m *Model) refreshConfigPathChoices() error {
+	choices, err := listJSONFilesInDir(".")
+	if err != nil {
+		m.configPathChoices = nil
+		m.configPathChoiceCursor = 0
+		m.configPathChoiceOffset = 0
+		return err
+	}
+
+	m.configPathChoices = choices
+	m.configPathChoiceCursor = 0
+	m.configPathChoiceOffset = 0
+	if len(choices) == 0 {
+		return nil
+	}
+
+	desired := strings.TrimSpace(m.configPathInput.Value())
+	if desired == "" {
+		desired = strings.TrimSpace(m.lastConfigPath)
+	}
+	desiredBase := filepathBase(desired)
+	for idx, choice := range choices {
+		if choice == desired || choice == desiredBase {
+			m.configPathChoiceCursor = idx
+			break
+		}
+	}
+	m.ensureConfigPathChoiceVisible()
+
+	if strings.TrimSpace(m.configPathInput.Value()) == "" {
+		m.configPathInput.SetValue(m.configPathChoices[m.configPathChoiceCursor])
+		m.configPathInput.CursorEnd()
+	}
+	return nil
+}
+
+func (m Model) renderConfigPathChoices(visibleRows int) string {
+	if len(m.configPathChoices) == 0 {
+		return mutedTextStyle("No .json files in current directory.")
+	}
+
+	visibleRows = maxInt(1, visibleRows)
+	start := clampInt(m.configPathChoiceOffset, 0, len(m.configPathChoices)-1)
+	end := minInt(len(m.configPathChoices), start+visibleRows)
+	if end-start < visibleRows && end > 0 {
+		start = maxInt(0, end-visibleRows)
+	}
+
+	lines := make([]string, 0, (end-start)+1)
+	for idx := start; idx < end; idx++ {
+		prefix := "  "
+		line := m.configPathChoices[idx]
+		if idx == m.configPathChoiceCursor {
+			prefix = "▶ "
+			line = historySelectedLineStyle.Render(prefix + line)
+		} else {
+			line = prefix + line
+		}
+		lines = append(lines, line)
+	}
+	lines = append(lines, mutedTextStyle(fmt.Sprintf("Showing %d-%d of %d", start+1, end, len(m.configPathChoices))))
+	return strings.Join(lines, "\n")
+}
+
+func mutedTextStyle(text string) string {
+	return lipgloss.NewStyle().Foreground(mutedText).Render(text)
 }
 
 func startRunCmd(svc *service.Manager, config map[string]any) tea.Cmd {
@@ -332,8 +581,9 @@ func loadBundleCmd(store *storage.Store, directory string) tea.Cmd {
 
 func sampleSystemMetricsCmd(gpuProbeEnabled bool) tea.Cmd {
 	return func() tea.Msg {
+		sampledAt := time.Now()
 		snapshot, err := collectSystemMetrics(gpuProbeEnabled)
-		return systemMetricsMsg{snapshot: snapshot, err: err}
+		return systemMetricsMsg{snapshot: snapshot, sampledAt: sampledAt, err: err}
 	}
 }
 
@@ -506,7 +756,7 @@ func readTotalGPUUsage() (float64, float64, string, string, bool) {
 }
 
 func pollTickCmd() tea.Cmd {
-	return tea.Tick(1200*time.Millisecond, func(at time.Time) tea.Msg {
+	return tea.Tick(metricsPollInterval, func(at time.Time) tea.Msg {
 		return pollTickMsg{at: at}
 	})
 }
@@ -661,7 +911,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resizePanels()
 		m.applyFocusState()
 		m.refreshHistoryView()
+		if m.showConfigPathPrompt {
+			m.ensureConfigPathChoiceVisible()
+		}
 		return m, nil
+
+	case tea.BlurMsg:
+		m.terminalFocused = false
+		return m, nil
+
+	case tea.FocusMsg:
+		m.terminalFocused = true
+		return m, sampleSystemMetricsCmd(m.gpuProbeEnabled)
 
 	case spinner.TickMsg:
 		if !m.running {
@@ -700,6 +961,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		sampleRepeats := 1
+		if !msg.sampledAt.IsZero() {
+			sampleRepeats = estimateMetricsCatchupSamples(
+				m.lastMetricsSampleAt,
+				msg.sampledAt,
+				metricsPollInterval,
+				maxMetricsCatchupSamples,
+			)
+			m.lastMetricsSampleAt = msg.sampledAt
+		}
 
 		if m.cpuHasBaseline {
 			deltaTotal := msg.snapshot.cpuTotalTicks - m.cpuLastTotal
@@ -707,7 +978,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if deltaTotal > 0 && deltaTotal >= deltaIdle {
 				busyPct := (float64(deltaTotal-deltaIdle) / float64(deltaTotal)) * 100.0
 				m.cpuUsagePct = clampFloat(busyPct, 0, 100)
-				m.cpuHistory = appendUsageSample(m.cpuHistory, m.cpuUsagePct, 160)
+				m.cpuHistory = appendUsageSampleN(m.cpuHistory, m.cpuUsagePct, 160, sampleRepeats)
 			}
 		} else {
 			m.cpuHasBaseline = true
@@ -718,7 +989,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.snapshot.memAvailable {
 			m.memAvailable = true
 			m.memUsagePct = clampFloat(msg.snapshot.memUsedPct, 0, 100)
-			m.memHistory = appendUsageSample(m.memHistory, m.memUsagePct, 160)
+			m.memHistory = appendUsageSampleN(m.memHistory, m.memUsagePct, 160, sampleRepeats)
 		}
 
 		m.gpuProbeEnabled = msg.snapshot.gpuProbeOK
@@ -728,7 +999,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gpuAvailable {
 			m.gpuUsagePct = clampFloat(msg.snapshot.gpuUtilPct, 0, 100)
 			m.gpuMemUsagePct = clampFloat(msg.snapshot.gpuMemUsedPct, 0, 100)
-			m.gpuHistory = appendUsageSample(m.gpuHistory, m.gpuUsagePct, 160)
+			m.gpuHistory = appendUsageSampleN(m.gpuHistory, m.gpuUsagePct, 160, sampleRepeats)
 		}
 		return m, nil
 
@@ -736,6 +1007,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.errorText = "Failed to load defaults: " + msg.err.Error()
 			m.statusText = "Defaults unavailable. You can still paste custom JSON config."
+			return m, nil
+		}
+		if m.configPinned {
+			m.statusText = "Defaults loaded. Existing config preserved."
 			return m, nil
 		}
 		blob, err := json.MarshalIndent(msg.defaults, "", "  ")
@@ -761,6 +1036,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshHistoryView()
 		return m, nil
+
+	case configFileLoadedMsg:
+		// Always close the prompt and restore focus when async load completes.
+		m.showConfigPathPrompt = false
+		m.configPathInput.Blur()
+		m.applyFocusState()
+		if msg.err != nil {
+			m.errorText = "Config file load failed: " + msg.err.Error()
+			return m, tea.ClearScreen
+		}
+		m.configEditor.SetValue(msg.text)
+		m.configPinned = true
+		m.lastConfigPath = strings.TrimSpace(msg.path)
+		m.errorText = ""
+		if m.lastConfigPath != "" {
+			m.statusText = "Loaded config file: " + m.lastConfigPath
+		} else {
+			m.statusText = "Loaded config file."
+		}
+		return m, tea.ClearScreen
 
 	case runStartedMsg:
 		if msg.err != nil {
@@ -949,6 +1244,57 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.showConfigPathPrompt {
+			switch msg.String() {
+			case "ctrl+c", "q":
+				if m.streamCancel != nil {
+					m.streamCancel()
+				}
+				return m, tea.Quit
+			case "up":
+				m.setConfigPathChoiceCursor(m.configPathChoiceCursor - 1)
+				return m, nil
+			case "down":
+				m.setConfigPathChoiceCursor(m.configPathChoiceCursor + 1)
+				return m, nil
+			case "pgup":
+				m.setConfigPathChoiceCursor(m.configPathChoiceCursor - m.configPathListVisibleRows())
+				return m, nil
+			case "pgdown":
+				m.setConfigPathChoiceCursor(m.configPathChoiceCursor + m.configPathListVisibleRows())
+				return m, nil
+			case "esc":
+				m.showConfigPathPrompt = false
+				m.configPathInput.Blur()
+				m.applyFocusState()
+				m.statusText = "Config file load cancelled."
+				return m, tea.ClearScreen
+			case "enter":
+				path := strings.TrimSpace(m.configPathInput.Value())
+				if path == "" && len(m.configPathChoices) > 0 {
+					path = m.configPathChoices[m.configPathChoiceCursor]
+				}
+				m.showConfigPathPrompt = false
+				m.configPathInput.Blur()
+				m.applyFocusState()
+				if path == "" {
+					m.errorText = "Config file path is required."
+					return m, tea.ClearScreen
+				}
+				m.lastConfigPath = path
+				m.errorText = ""
+				m.statusText = "Loading config file..."
+				return m, loadConfigFileCmd(path)
+			}
+			var cmd tea.Cmd
+			before := m.configPathInput.Value()
+			m.configPathInput, cmd = m.configPathInput.Update(msg)
+			if m.configPathInput.Value() != before {
+				m.syncConfigPathChoiceToInput()
+			}
+			return m, cmd
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			if m.streamCancel != nil {
@@ -965,36 +1311,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.applyFocusState()
 			m.statusText = "Focus: " + focusPaneLabel(m.focusPane)
 			return m, nil
-			case "?":
-				m.showHelp = !m.showHelp
-				return m, nil
-			case "ctrl+r":
-				if m.running || m.finalizingRun {
-					if recoverCmd, recovered := m.recoverTerminalStateForRestart(time.Now()); recovered {
-						if m.running || m.finalizingRun {
-							return m, recoverCmd
-						}
-						cfg, err := parseConfigJSON(m.configEditor.Value())
-						if err != nil {
-							m.errorText = "Config parse error: " + err.Error()
-							return m, recoverCmd
-						}
-						m.errorText = ""
-						return m, tea.Batch(recoverCmd, startRunCmd(m.service, cfg))
-					}
-					m.errorText = "A run is active or finalizing. Wait for completion before starting another."
-					if strings.TrimSpace(m.currentRunID) != "" {
-						return m, fetchRunStatusCmd(m.service, m.currentRunID)
-					}
-					return m, nil
-				}
-				cfg, err := parseConfigJSON(m.configEditor.Value())
-				if err != nil {
-					m.errorText = "Config parse error: " + err.Error()
-					return m, nil
-				}
+		case "?":
+			m.showHelp = !m.showHelp
+			return m, nil
+		case "ctrl+o":
+			m.showConfigPathPrompt = true
+			m.configPathInput.SetValue(m.lastConfigPath)
+			m.configPathInput.CursorEnd()
+			m.configPathInput.Focus()
+			if err := m.refreshConfigPathChoices(); err != nil {
+				m.errorText = "Could not list .json files in current directory: " + err.Error()
+			} else {
 				m.errorText = ""
-				return m, startRunCmd(m.service, cfg)
+			}
+			m.statusText = "Choose a JSON file with up/down or type a path, then press Enter."
+			m.applyFocusState()
+			return m, nil
+		case "ctrl+r":
+			if m.running || m.finalizingRun {
+				if recoverCmd, recovered := m.recoverTerminalStateForRestart(time.Now()); recovered {
+					if m.running || m.finalizingRun {
+						return m, recoverCmd
+					}
+					cfg, err := parseConfigJSON(m.configEditor.Value())
+					if err != nil {
+						m.errorText = "Config parse error: " + err.Error()
+						return m, recoverCmd
+					}
+					m.errorText = ""
+					return m, tea.Batch(recoverCmd, startRunCmd(m.service, cfg))
+				}
+				m.errorText = "A run is active or finalizing. Wait for completion before starting another."
+				if strings.TrimSpace(m.currentRunID) != "" {
+					return m, fetchRunStatusCmd(m.service, m.currentRunID)
+				}
+				return m, nil
+			}
+			cfg, err := parseConfigJSON(m.configEditor.Value())
+			if err != nil {
+				m.errorText = "Config parse error: " + err.Error()
+				return m, nil
+			}
+			m.errorText = ""
+			return m, startRunCmd(m.service, cfg)
 		case "ctrl+x":
 			if !m.running || strings.TrimSpace(m.currentRunID) == "" {
 				m.errorText = "No active run to cancel."
@@ -1032,7 +1391,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.focusPane {
 		case paneConfig:
 			var cmd tea.Cmd
+			before := m.configEditor.Value()
 			m.configEditor, cmd = m.configEditor.Update(msg)
+			if m.configEditor.Value() != before {
+				m.configPinned = true
+			}
 			return m, cmd
 		case paneTelemetry:
 			var cmd tea.Cmd
@@ -1078,8 +1441,7 @@ func (m Model) View() string {
 	innerWidth := maxInt(40, m.width-2)
 	innerHeight := maxInt(12, m.height-2)
 
-	header := headerStyle.Render("BlackSwan Command Deck")
-	subtitle := subHeaderStyle.Render("Interactive Monte Carlo cockpit powered by Charm + local Python bridge")
+	header := headerStyle.Render("Blackswan Command Deck")
 
 	statusPrefix := "*"
 	if m.running {
@@ -1096,7 +1458,7 @@ func (m Model) View() string {
 
 	configPanel := renderPanel(
 		"Config JSON",
-		m.configEditor.View(),
+		highlightJSONKeys(m.configEditor.View()),
 		m.configPanelW,
 		m.configPanelH,
 		m.focusPane == paneConfig,
@@ -1142,12 +1504,29 @@ func (m Model) View() string {
 		),
 	)
 
-	parts := []string{header, subtitle, statusLine, topRow, bottomRow}
+	parts := []string{header, statusLine}
+	if m.showConfigPathPrompt {
+		promptWidth := clampInt(innerWidth-4, 42, 90)
+		listRows := m.configPathListVisibleRows()
+		promptHeight := clampInt(9+listRows, 12, maxInt(12, innerHeight-2))
+		promptBody := strings.Join([]string{
+			"Path to local JSON config file:",
+			m.configPathInput.View(),
+			"",
+			".json files in current directory:",
+			m.renderConfigPathChoices(listRows),
+			"",
+			"up/down select | enter load | esc cancel",
+		}, "\n")
+		parts = append(parts, renderPanel("Load Config File", promptBody, promptWidth, promptHeight, true))
+	}
+	parts = append(parts, topRow, bottomRow)
 	if m.showHelp {
-		parts = append(parts, helpStyle.Render("ctrl+r run | ctrl+x cancel | tab/shift+tab cycle panes | up/down or wheel scroll focused pane | enter load history item | ctrl+l clear telemetry | q quit"))
+		parts = append(parts, helpStyle.Render("ctrl+r run | ctrl+o load file | ctrl+x cancel | tab/shift+tab cycle panes | up/down or wheel scroll focused pane | enter load history item | ctrl+l clear telemetry | q quit"))
 	}
 
 	body := strings.Join(parts, "\n")
+	body = fitTextHeight(body, innerHeight)
 	return lipgloss.NewStyle().
 		Background(chromeBG).
 		Foreground(lipgloss.Color("#E8F0F2")).
@@ -1158,6 +1537,12 @@ func (m Model) View() string {
 }
 
 func (m *Model) applyFocusState() {
+	if m.showConfigPathPrompt {
+		m.configEditor.Blur()
+		m.configPathInput.Focus()
+		return
+	}
+	m.configPathInput.Blur()
 	if m.focusPane == paneConfig {
 		m.configEditor.Focus()
 		return
@@ -1293,6 +1678,7 @@ func (m *Model) resizePanels() {
 	m.history.Height = historyViewH
 	m.historyW = historyInnerW + 4
 	m.historyH = historyViewH + 3
+	m.configPathInput.Width = clampInt(usableW-22, 20, 78)
 
 	if len(m.telemetryEntries) > 0 {
 		m.rebuildTelemetryContent(m.telemetryAutoFollow)
@@ -1304,6 +1690,10 @@ func (m *Model) resizePanels() {
 func (m *Model) refreshHistoryView() {
 	if len(m.historyItems) == 0 {
 		m.history.SetContent("No saved runs yet.\nCompleted runs are stored under ./runs")
+		m.history.SetYOffset(0)
+		m.historyCursorTopLine = 0
+		m.historyCursorBottomLine = 0
+		m.historyRenderedLines = 0
 		return
 	}
 
@@ -1314,7 +1704,10 @@ func (m *Model) refreshHistoryView() {
 		m.historyCursor = 0
 	}
 
+	contentWidth := maxInt(1, m.history.Width)
 	lines := make([]string, 0, len(m.historyItems))
+	m.historyCursorTopLine = 0
+	m.historyCursorBottomLine = 0
 	for idx, item := range m.historyItems {
 		cursor := " "
 		if idx == m.historyCursor {
@@ -1322,9 +1715,69 @@ func (m *Model) refreshHistoryView() {
 		}
 		frac := item.RecommendedFraction * 100
 		line := fmt.Sprintf("%s %s | %.2f%% | %s", cursor, trimTime(item.SavedAt), frac, safeMode(item.ObjectiveMode))
-		lines = append(lines, line)
+		wrapped := wrapLineToWidth(line, contentWidth)
+		lineTop := len(lines)
+		for _, segment := range wrapped {
+			if idx == m.historyCursor {
+				segment = historySelectedLineStyle.Render(segment)
+			}
+			lines = append(lines, segment)
+		}
+		lineBottom := len(lines) - 1
+		if idx == m.historyCursor {
+			m.historyCursorTopLine = lineTop
+			m.historyCursorBottomLine = lineBottom
+		}
 	}
 	m.history.SetContent(strings.Join(lines, "\n"))
+	m.historyRenderedLines = len(lines)
+	m.ensureHistoryCursorVisible()
+}
+
+func (m *Model) ensureHistoryCursorVisible() {
+	if m.historyRenderedLines == 0 {
+		m.history.SetYOffset(0)
+		return
+	}
+	visibleRows := maxInt(1, m.history.Height)
+	cursorTop := clampInt(m.historyCursorTopLine, 0, m.historyRenderedLines-1)
+	cursorBottom := clampInt(m.historyCursorBottomLine, cursorTop, m.historyRenderedLines-1)
+	top := clampInt(m.history.YOffset, 0, m.historyRenderedLines-1)
+	bottom := top + visibleRows - 1
+	scrollMargin := clampInt(visibleRows/4, 1, 2)
+	upperBound := top + scrollMargin
+	lowerBound := bottom - scrollMargin
+	if cursorTop < upperBound {
+		m.history.SetYOffset(cursorTop - scrollMargin)
+		return
+	}
+	if cursorBottom > lowerBound {
+		m.history.SetYOffset(cursorBottom - (visibleRows - 1 - scrollMargin))
+		return
+	}
+	m.history.SetYOffset(top)
+}
+
+func wrapLineToWidth(line string, width int) []string {
+	width = maxInt(1, width)
+	runes := []rune(line)
+	if len(runes) == 0 {
+		return []string{""}
+	}
+	if len(runes) <= width {
+		return []string{line}
+	}
+	segments := make([]string, 0, (len(runes)/width)+1)
+	start := 0
+	for start < len(runes) {
+		end := start + width
+		if end > len(runes) {
+			end = len(runes)
+		}
+		segments = append(segments, string(runes[start:end]))
+		start = end
+	}
+	return segments
 }
 
 func parseConfigJSON(raw string) (map[string]any, error) {
@@ -1479,21 +1932,22 @@ func renderUsageTrend(samples []float64, width int) string {
 	}
 
 	levels := []rune("._-:=+*#%@")
-	step := float64(len(samples)) / float64(width)
-	if step <= 0 {
-		step = 1
+	out := make([]rune, width)
+	for idx := range out {
+		out[idx] = '.'
 	}
 
-	out := make([]rune, width)
-	for idx := 0; idx < width; idx++ {
-		source := int(math.Floor(float64(idx) * step))
-		if source >= len(samples) {
-			source = len(samples) - 1
-		}
-		p := clampFloat(samples[source], 0, 100)
+	window := samples
+	if len(window) > width {
+		window = window[len(window)-width:]
+	}
+	start := width - len(window)
+	for idx := 0; idx < len(window); idx++ {
+		source := window[idx]
+		p := clampFloat(source, 0, 100)
 		levelIdx := int(math.Round((p / 100.0) * float64(len(levels)-1)))
 		levelIdx = clampInt(levelIdx, 0, len(levels)-1)
-		out[idx] = levels[levelIdx]
+		out[start+idx] = levels[levelIdx]
 	}
 	return string(out)
 }
@@ -1507,6 +1961,103 @@ func appendUsageSample(history []float64, value float64, maxLen int) []float64 {
 		history = history[len(history)-maxLen:]
 	}
 	return history
+}
+
+func appendUsageSampleN(history []float64, value float64, maxLen int, count int) []float64 {
+	count = clampInt(count, 1, maxMetricsCatchupSamples)
+	for idx := 0; idx < count; idx++ {
+		history = appendUsageSample(history, value, maxLen)
+	}
+	return history
+}
+
+func estimateMetricsCatchupSamples(prev, current time.Time, interval time.Duration, maxSamples int) int {
+	if prev.IsZero() || current.IsZero() || interval <= 0 {
+		return 1
+	}
+	if !current.After(prev) {
+		return 1
+	}
+	gap := current.Sub(prev)
+	if gap <= interval {
+		return 1
+	}
+	samples := int(gap / interval)
+	samples = clampInt(samples, 1, maxSamples)
+	return samples
+}
+
+func highlightJSONKeys(text string) string {
+	if strings.IndexByte(text, '"') == -1 {
+		return text
+	}
+	matches := jsonKeyPattern.FindAllStringIndex(text, -1)
+	if len(matches) == 0 {
+		return text
+	}
+
+	var builder strings.Builder
+	builder.Grow(len(text) + len(matches)*8)
+	cursor := 0
+
+	for _, bounds := range matches {
+		start := bounds[0]
+		end := bounds[1]
+		if start < cursor {
+			continue
+		}
+		builder.WriteString(text[cursor:start])
+		match := text[start:end]
+		colonIdx := strings.LastIndex(match, ":")
+		if colonIdx <= 0 {
+			builder.WriteString(match)
+			cursor = end
+			continue
+		}
+		keyPortion := match[:colonIdx]
+		suffix := match[colonIdx:]
+		keyStyle := jsonKeyStyle
+		if jsonKeyHasObjectValue(text, end) {
+			keyStyle = jsonObjectKeyStyle
+		}
+		builder.WriteString(keyStyle.Render(keyPortion))
+		builder.WriteString(suffix)
+		cursor = end
+	}
+	builder.WriteString(text[cursor:])
+	return builder.String()
+}
+
+func jsonKeyHasObjectValue(text string, valueSearchStart int) bool {
+	valueStart := nextNonWhitespaceIndex(text, valueSearchStart)
+	return valueStart < len(text) && text[valueStart] == '{'
+}
+
+func nextNonWhitespaceIndex(text string, start int) int {
+	idx := start
+	for idx < len(text) {
+		switch text[idx] {
+		case ' ', '\t', '\n', '\r':
+			idx++
+		default:
+			return idx
+		}
+	}
+	return idx
+}
+
+func fitTextHeight(text string, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) appendTelemetryLine(line string) {

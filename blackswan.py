@@ -19,6 +19,20 @@ DEFAULT_CONFIG = {
         "ltcg_tax_rate": 0.15,
         "monthly_expenses": 6_000.0,
         "monthly_savings": 8_000.0,
+        "retirement": {
+            "enabled": False,
+            "start_month_from_start": None,
+            "safe_withdrawal_rate_annual": 0.04,
+            "expense_reduction_fraction": 1.0,
+            "dynamic_safe_withdrawal_rate": False,
+        },
+        "crash_reinvestment": {
+            "enabled": False,
+            "crash_drawdown_threshold": 0.20,
+            "recovery_fraction_of_peak": 0.90,
+            "reinvest_fraction_of_initial_sale_proceeds": 1.0,
+            "cash_buffer_months": 12,
+        },
     },
     "market": {
         "volatility_annual": 0.15,
@@ -190,6 +204,48 @@ def validate_config(config):
         raise ValueError("portfolio.ltcg_tax_rate must be in [0, 1).")
     if portfolio["monthly_expenses"] < 0 or portfolio["monthly_savings"] < 0:
         raise ValueError("portfolio.monthly_expenses and monthly_savings must be >= 0.")
+    retirement = portfolio.get("retirement")
+    if not isinstance(retirement, dict):
+        raise ValueError("portfolio.retirement must be an object.")
+    if not isinstance(retirement["enabled"], bool):
+        raise ValueError("portfolio.retirement.enabled must be a bool.")
+    if retirement["start_month_from_start"] is not None:
+        if (
+            isinstance(retirement["start_month_from_start"], bool)
+            or not isinstance(retirement["start_month_from_start"], int)
+        ):
+            raise ValueError("portfolio.retirement.start_month_from_start must be an int >= 0 or None.")
+        if retirement["start_month_from_start"] < 0:
+            raise ValueError("portfolio.retirement.start_month_from_start must be >= 0.")
+    if retirement["enabled"] and retirement["start_month_from_start"] is None:
+        raise ValueError(
+            "portfolio.retirement.start_month_from_start is required when retirement is enabled."
+        )
+    if retirement["safe_withdrawal_rate_annual"] < 0:
+        raise ValueError("portfolio.retirement.safe_withdrawal_rate_annual must be >= 0.")
+    if not (0.0 <= retirement["expense_reduction_fraction"] <= 1.0):
+        raise ValueError("portfolio.retirement.expense_reduction_fraction must be in [0, 1].")
+    if not isinstance(retirement["dynamic_safe_withdrawal_rate"], bool):
+        raise ValueError("portfolio.retirement.dynamic_safe_withdrawal_rate must be a bool.")
+    crash_reinvestment = portfolio.get("crash_reinvestment")
+    if not isinstance(crash_reinvestment, dict):
+        raise ValueError("portfolio.crash_reinvestment must be an object.")
+    if not isinstance(crash_reinvestment["enabled"], bool):
+        raise ValueError("portfolio.crash_reinvestment.enabled must be a bool.")
+    if not (0.0 < crash_reinvestment["crash_drawdown_threshold"] < 1.0):
+        raise ValueError("portfolio.crash_reinvestment.crash_drawdown_threshold must be in (0, 1).")
+    if not (0.0 < crash_reinvestment["recovery_fraction_of_peak"] <= 1.0):
+        raise ValueError("portfolio.crash_reinvestment.recovery_fraction_of_peak must be in (0, 1].")
+    if not (0.0 <= crash_reinvestment["reinvest_fraction_of_initial_sale_proceeds"] <= 1.0):
+        raise ValueError(
+            "portfolio.crash_reinvestment.reinvest_fraction_of_initial_sale_proceeds must be in [0, 1]."
+        )
+    if (
+        isinstance(crash_reinvestment["cash_buffer_months"], bool)
+        or not isinstance(crash_reinvestment["cash_buffer_months"], int)
+        or crash_reinvestment["cash_buffer_months"] < 0
+    ):
+        raise ValueError("portfolio.crash_reinvestment.cash_buffer_months must be an int >= 0.")
 
     if market["volatility_annual"] < 0:
         raise ValueError("market.volatility_annual must be >= 0.")
@@ -735,71 +791,174 @@ def _simulate_strategy_fraction(fraction_sold, universe, config):
     ltcg_tax_rate = portfolio["ltcg_tax_rate"]
     monthly_expenses = portfolio["monthly_expenses"]
     monthly_savings = portfolio["monthly_savings"]
+    retirement = portfolio["retirement"]
+    retirement_enabled = bool(retirement["enabled"])
+    retirement_start_month = retirement["start_month_from_start"]
+    if retirement_start_month is None:
+        retirement_start_month = -1
+    retirement_start_month = int(retirement_start_month)
+    retirement_swr_monthly = float(retirement["safe_withdrawal_rate_annual"]) / 12.0
+    retirement_expense_reduction = float(retirement["expense_reduction_fraction"])
+    retirement_dynamic_swr = bool(retirement["dynamic_safe_withdrawal_rate"])
+    crash_reinvestment = portfolio["crash_reinvestment"]
+    reinvest_enabled = bool(crash_reinvestment["enabled"])
+    reinvest_crash_drawdown_threshold = float(crash_reinvestment["crash_drawdown_threshold"])
+    reinvest_recovery_fraction_of_peak = float(crash_reinvestment["recovery_fraction_of_peak"])
+    reinvest_fraction_of_initial_sale_proceeds = float(
+        crash_reinvestment["reinvest_fraction_of_initial_sale_proceeds"]
+    )
+    reinvest_cash_buffer_months = float(crash_reinvestment["cash_buffer_months"])
     r_cash = market["cash_yield_annual"] / 12.0
 
     gross_sold = fraction_sold * initial_portfolio
     basis_sold = fraction_sold * initial_basis
     capital_gains = max(0.0, gross_sold - basis_sold)
     tax_paid = capital_gains * ltcg_tax_rate
+    initial_sale_net_proceeds = gross_sold - tax_paid
 
     cash = np.full(n_sims, gross_sold - tax_paid, dtype=np.float64)
     stocks = np.full(n_sims, (1.0 - fraction_sold) * initial_portfolio, dtype=np.float64)
     basis = np.full(n_sims, (1.0 - fraction_sold) * initial_basis, dtype=np.float64)
     market_index = np.ones(n_sims, dtype=np.float64)
     ruined = np.zeros(n_sims, dtype=bool)
+    remaining_reinvest_budget = np.full(n_sims, initial_sale_net_proceeds, dtype=np.float64)
+    reinvest_done = np.zeros(n_sims, dtype=bool)
+    peak_index = np.ones(n_sims, dtype=np.float64)
+    in_crash = np.zeros(n_sims, dtype=bool)
+    crash_peak_index = np.ones(n_sims, dtype=np.float64)
+    crash_trough_index = np.ones(n_sims, dtype=np.float64)
 
     monthly_returns = universe["monthly_returns"]
     unemployment_matrix = universe["unemployment_matrix"]
 
+    def sell_stock_for_cash_requirement(required_cash):
+        required_cash = np.asarray(required_cash, dtype=np.float64)
+        required_cash = np.maximum(required_cash, 0.0)
+        remaining_cash = required_cash.copy()
+
+        active = remaining_cash > 1e-9
+        if not np.any(active):
+            return required_cash - remaining_cash, remaining_cash
+
+        sellable = active & (stocks > 1e-12)
+        if not np.any(sellable):
+            return required_cash - remaining_cash, remaining_cash
+
+        active_idx = np.where(sellable)[0]
+        s_act = stocks[active_idx]
+        b_act = basis[active_idx]
+        m_act = market_index[active_idx]
+        need_act = remaining_cash[active_idx]
+
+        basis_per_unit = b_act / s_act
+        gain_per_unit = np.maximum(0.0, m_act - basis_per_unit)
+        tax_per_unit = gain_per_unit * ltcg_tax_rate
+        net_per_unit = np.maximum(1e-12, m_act - tax_per_unit)
+
+        units_to_sell = need_act / net_per_unit
+        units_to_sell = np.minimum(units_to_sell, s_act)
+
+        proceeds = units_to_sell * net_per_unit
+        remaining_cash[active_idx] = np.maximum(0.0, need_act - proceeds)
+
+        s_new = s_act - units_to_sell
+        b_new = b_act * (s_new / s_act)
+
+        stocks[active_idx] = s_new
+        basis[active_idx] = b_new
+        return required_cash - remaining_cash, remaining_cash
+
     for month_idx in range(horizon):
         market_index *= 1.0 + monthly_returns[:, month_idx]
         cash *= 1.0 + r_cash
+        peak_index = np.maximum(peak_index, market_index)
 
-        is_unemployed = unemployment_matrix[:, month_idx]
-        is_employed = ~is_unemployed
+        if reinvest_enabled and not np.all(reinvest_done):
+            active = ~reinvest_done
+            drawdown = np.maximum(0.0, 1.0 - (market_index / np.maximum(peak_index, 1e-12)))
+            enter_crash = active & (~in_crash) & (drawdown >= reinvest_crash_drawdown_threshold)
+            if np.any(enter_crash):
+                in_crash[enter_crash] = True
+                crash_peak_index[enter_crash] = peak_index[enter_crash]
+                crash_trough_index[enter_crash] = market_index[enter_crash]
+            if np.any(in_crash):
+                crash_trough_index[in_crash] = np.minimum(crash_trough_index[in_crash], market_index[in_crash])
+
+            recovered = (
+                active
+                & in_crash
+                & (market_index >= (crash_peak_index * reinvest_recovery_fraction_of_peak))
+            )
+            if np.any(recovered):
+                retirement_active_for_buffer = retirement_enabled and month_idx >= retirement_start_month
+                if retirement_active_for_buffer:
+                    expense_for_buffer = monthly_expenses * retirement_expense_reduction
+                else:
+                    expense_for_buffer = monthly_expenses
+                cash_buffer_required = reinvest_cash_buffer_months * expense_for_buffer
+                available_cash = np.maximum(0.0, cash - cash_buffer_required)
+                target_amount = (
+                    reinvest_fraction_of_initial_sale_proceeds * remaining_reinvest_budget
+                )
+                reinvest_amount = np.minimum(
+                    np.minimum(target_amount, remaining_reinvest_budget),
+                    available_cash,
+                )
+                reinvest_amount = np.where(recovered, np.maximum(0.0, reinvest_amount), 0.0)
+                positive = reinvest_amount > 1e-9
+                if np.any(positive):
+                    stocks[positive] += reinvest_amount[positive] / market_index[positive]
+                    basis[positive] += reinvest_amount[positive]
+                    cash[positive] -= reinvest_amount[positive]
+                    remaining_reinvest_budget[positive] = np.maximum(
+                        0.0,
+                        remaining_reinvest_budget[positive] - reinvest_amount[positive],
+                    )
+                reinvest_done[recovered] = True
+                in_crash[recovered] = False
+
+        retirement_active = retirement_enabled and month_idx >= retirement_start_month
+        if retirement_active:
+            is_unemployed = np.ones(n_sims, dtype=bool)
+            is_employed = np.zeros(n_sims, dtype=bool)
+            expense_this_month = monthly_expenses * retirement_expense_reduction
+            if retirement_dynamic_swr:
+                retirement_withdrawal_need = np.full(n_sims, expense_this_month, dtype=np.float64)
+            else:
+                retirement_withdrawal_need = np.maximum(
+                    0.0,
+                    (stocks * market_index) * retirement_swr_monthly,
+                )
+            retirement_withdrawal_proceeds, _ = sell_stock_for_cash_requirement(retirement_withdrawal_need)
+            cash += retirement_withdrawal_proceeds
+            need = np.full(n_sims, expense_this_month, dtype=np.float64)
+        else:
+            is_unemployed = unemployment_matrix[:, month_idx]
+            is_employed = ~is_unemployed
+            need = np.where(is_unemployed, monthly_expenses, 0.0)
 
         if np.any(is_employed):
             stocks[is_employed] += monthly_savings / market_index[is_employed]
             basis[is_employed] += monthly_savings
 
-        need = np.where(is_unemployed, monthly_expenses, 0.0)
-
+        cash_before_expense = cash.copy()
         from_cash = np.minimum(need, cash)
         cash -= from_cash
         need -= from_cash
+        if reinvest_enabled:
+            budget_share = np.zeros(n_sims, dtype=np.float64)
+            has_cash = cash_before_expense > 1e-12
+            budget_share[has_cash] = np.clip(
+                remaining_reinvest_budget[has_cash] / cash_before_expense[has_cash],
+                0.0,
+                1.0,
+            )
+            remaining_reinvest_budget = np.maximum(0.0, remaining_reinvest_budget - (from_cash * budget_share))
 
         need_more = need > 1e-9
         if np.any(need_more):
-            no_assets = need_more & (stocks <= 1e-12)
-            ruined[no_assets] = True
-
-            active = need_more & (stocks > 1e-12)
-            if np.any(active):
-                active_idx = np.where(active)[0]
-
-                s_act = stocks[active_idx]
-                b_act = basis[active_idx]
-                m_act = market_index[active_idx]
-                need_act = need[active_idx]
-
-                basis_per_unit = b_act / s_act
-                gain_per_unit = np.maximum(0.0, m_act - basis_per_unit)
-                tax_per_unit = gain_per_unit * ltcg_tax_rate
-                net_per_unit = np.maximum(1e-12, m_act - tax_per_unit)
-
-                units_to_sell = need_act / net_per_unit
-                overdraw = units_to_sell > s_act
-                units_to_sell[overdraw] = s_act[overdraw]
-
-                proceeds = units_to_sell * net_per_unit
-                remaining_need = need_act - proceeds
-                ruined[active_idx] |= remaining_need > 1e-9
-
-                s_new = s_act - units_to_sell
-                b_new = b_act * (s_new / s_act)
-
-                stocks[active_idx] = s_new
-                basis[active_idx] = b_new
+            _, remaining_need = sell_stock_for_cash_requirement(need)
+            ruined |= remaining_need > 1e-9
 
     portfolio_value = stocks * market_index
     final_gains = np.maximum(0.0, portfolio_value - basis)
@@ -981,19 +1140,48 @@ def _distribution_mode_triplet(spec):
     return None
 
 
+def _probability_distribution_params(spec):
+    if isinstance(spec, (int, float)):
+        value = float(spec)
+        return 0, value, value, value, value
+    if not isinstance(spec, dict):
+        return None
+
+    dist = spec.get("dist")
+    if dist == "uniform":
+        low = float(spec["low"])
+        high = float(spec["high"])
+        return 1, low, high, high, high
+    if dist == "triangular":
+        left = float(spec["left"])
+        mode = float(spec["mode"])
+        right = float(spec["right"])
+        return 2, left, mode, right, right
+    if dist == "beta":
+        return (
+            3,
+            float(spec["a"]),
+            float(spec["b"]),
+            float(spec["low"]),
+            float(spec["high"]),
+        )
+    return None
+
+
 def _build_synthetic_generation_params(config, horizon_months, chunk_start):
     beliefs = config["beliefs"]
     simulation = config["simulation"]
     market = config["market"]
 
+    prob_crash_params = _probability_distribution_params(beliefs["prob_crash"])
     crash_start_triplet = _distribution_mode_triplet(beliefs["crash_start_month"])
     crash_duration_triplet = _distribution_mode_triplet(beliefs["crash_duration_months"])
     crash_severity_triplet = _distribution_mode_triplet(beliefs["crash_severity_drop"])
     if (
-        crash_start_triplet is None
+        prob_crash_params is None
+        or crash_start_triplet is None
         or crash_duration_triplet is None
         or crash_severity_triplet is None
-        or not isinstance(beliefs["prob_crash"], (int, float))
         or not isinstance(beliefs["prob_layoff_during_crash"], (int, float))
         or not isinstance(beliefs["prob_layoff_baseline"], (int, float))
     ):
@@ -1008,7 +1196,11 @@ def _build_synthetic_generation_params(config, horizon_months, chunk_start):
         "horizon": int(horizon_months),
         "sigma": sigma,
         "monthly_market_drift": monthly_market_drift,
-        "prob_crash": float(beliefs["prob_crash"]),
+        "prob_crash_mode": int(prob_crash_params[0]),
+        "prob_crash_a": float(prob_crash_params[1]),
+        "prob_crash_b": float(prob_crash_params[2]),
+        "prob_crash_c": float(prob_crash_params[3]),
+        "prob_crash_d": float(prob_crash_params[4]),
         "crash_start_mode": int(crash_start_triplet[0]),
         "crash_start_a": float(crash_start_triplet[1]),
         "crash_start_b": float(crash_start_triplet[2]),
@@ -1049,7 +1241,9 @@ def _can_use_device_scenario_generation(config, use_cuda_backend):
         return False
     if _distribution_mode_triplet(beliefs["crash_severity_drop"]) is None:
         return False
-    for key in ("prob_crash", "prob_layoff_during_crash", "prob_layoff_baseline"):
+    if _probability_distribution_params(beliefs["prob_crash"]) is None:
+        return False
+    for key in ("prob_layoff_during_crash", "prob_layoff_baseline"):
         if not isinstance(beliefs[key], (int, float)):
             return False
     return True
@@ -2406,6 +2600,32 @@ def run_monte_carlo_optimization(config=None, verbose=True, progress_callback=No
     risk = merged_config["risk"]
     simulation = merged_config["simulation"]
     gpu = merged_config["gpu"]
+    retirement_cfg = merged_config["portfolio"]["retirement"]
+    reinvestment_cfg = merged_config["portfolio"]["crash_reinvestment"]
+
+    retirement_metadata = {
+        "enabled": bool(retirement_cfg["enabled"]),
+        "start_month_from_start": (
+            int(retirement_cfg["start_month_from_start"])
+            if retirement_cfg["start_month_from_start"] is not None
+            else None
+        ),
+        "forced_unemployment_after_start": bool(retirement_cfg["enabled"]),
+        "dynamic_safe_withdrawal_rate": bool(retirement_cfg["dynamic_safe_withdrawal_rate"]),
+        "safe_withdrawal_rate_annual": float(retirement_cfg["safe_withdrawal_rate_annual"]),
+        "expense_reduction_fraction": float(retirement_cfg["expense_reduction_fraction"]),
+    }
+    reinvestment_metadata = {
+        "enabled": bool(reinvestment_cfg["enabled"]),
+        "trigger_mode": "drawdown_threshold",
+        "frequency": "once_per_path",
+        "crash_drawdown_threshold": float(reinvestment_cfg["crash_drawdown_threshold"]),
+        "recovery_fraction_of_peak": float(reinvestment_cfg["recovery_fraction_of_peak"]),
+        "reinvest_fraction_of_initial_sale_proceeds": float(
+            reinvestment_cfg["reinvest_fraction_of_initial_sale_proceeds"]
+        ),
+        "cash_buffer_months": int(reinvestment_cfg["cash_buffer_months"]),
+    }
 
     fractions_to_test = np.linspace(
         decision_grid["min_fraction"],
@@ -2483,6 +2703,8 @@ def run_monte_carlo_optimization(config=None, verbose=True, progress_callback=No
             execution["fallback_reason"] = gpu_error
         else:
             execution["fallback_reason"] = f"{gpu_error}; {execution['fallback_reason']}"
+    execution["retirement"] = retirement_metadata
+    execution["reinvestment"] = reinvestment_metadata
 
     if verbose:
         summary = universe_summary
@@ -2570,6 +2792,8 @@ def run_monte_carlo_optimization(config=None, verbose=True, progress_callback=No
         "diagnostics_by_fraction": diagnostics,
         "universe_summary": universe_summary,
         "execution": execution,
+        "retirement": retirement_metadata,
+        "reinvestment": reinvestment_metadata,
     }
 
     _emit_progress(

@@ -1,0 +1,99 @@
+{
+  "portfolio": {
+    "initial_portfolio": 2000000.0,
+    "initial_basis": 1500000.0,
+    "ltcg_tax_rate": 0.22,
+    "monthly_expenses": 10000.0,
+    "monthly_savings": 16750.0,
+    "retirement": {
+      "enabled": true,
+      "start_month_from_start": 48,
+      "safe_withdrawal_rate_annual": 0.04,
+      "expense_reduction_fraction": 0.8,
+      "dynamic_safe_withdrawal_rate": true
+    },
+    "crash_reinvestment": {
+      "enabled": true,
+      "crash_drawdown_threshold": 0.2,
+      "recovery_fraction_of_peak": 0.9,
+      "reinvest_fraction_of_initial_sale_proceeds": 1.0,
+      "cash_buffer_months": 12
+    }
+  },
+  "market": {
+    "volatility_annual": 0.18,
+    "cash_yield_annual": 0.04,
+    "market_yield_annual": 0.09
+  },
+  "simulation": {
+    "n_sims": 5000000,
+    "seed": 20260224,
+    "horizon_months": 180,
+    "post_crash_buffer_months": 24,
+    "layoff_probabilities_are_annual": true,
+    "crash_layoff_min_duration_months": 12,
+    "baseline_layoff_min_duration_months": 2,
+    "baseline_layoff_max_duration_months": 9,
+    "parallel_enabled": false
+  },
+  "decision_grid": {
+    "min_fraction": 0.0,
+    "max_fraction": 1.0,
+    "num_points": 101
+  },
+  "risk": {
+    "objective_mode": "consensus",
+    "max_ruin_probability": 0.005,
+    "alpha": 0.1,
+    "lambda": 0.5,
+    "shortfall_floor": null,
+    "log_utility_wealth_floor": 1.0,
+    "consensus_tolerance": 0.002
+  },
+  "beliefs": {
+    "prob_crash": {
+      "dist": "beta",
+      "a": 3.0,
+      "b": 4.0,
+      "low": 0.15,
+      "high": 0.75
+    },
+    "crash_start_month": {
+      "dist": "triangular",
+      "left": 3,
+      "mode": 9,
+      "right": 30
+    },
+    "crash_duration_months": {
+      "dist": "triangular",
+      "left": 24,
+      "mode": 60,
+      "right": 96
+    },
+    "crash_severity_drop": {
+      "dist": "triangular",
+      "left": 0.3,
+      "mode": 0.45,
+      "right": 0.6
+    },
+    "prob_layoff_during_crash": 0.2,
+    "prob_layoff_baseline": 0.04
+  },
+  "gpu": {
+    "enabled": true,
+    "device_id": 0,
+    "prefer_cuda_extension": true,
+    "fallback_to_cpu_on_error": false,
+    "device_scenario_generation": true,
+    "precision_mode": "mixed",
+    "cvar_mode": "streaming_near_exact",
+    "cvar_refine_pass": true,
+    "refine_top_k": 5,
+    "streams": 2,
+    "scenario_chunk_size": 262144,
+    "fraction_tile_size": 64,
+    "max_vram_utilization": 0.9,
+    "min_chunk_size": 32768,
+    "oom_backoff_factor": 0.5
+  }
+}

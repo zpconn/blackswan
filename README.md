@@ -403,9 +403,17 @@ It launches a local Python service, streams live telemetry, and stores run bundl
 go run ./cmd/blackswan-tui
 ```
 
+Preload a config file at startup:
+
+```bash
+. .venv/bin/activate
+go run ./cmd/blackswan-tui --config ./my-config.json
+```
+
 ### Core controls
 
 - `ctrl+r`: start run with current JSON config
+- `ctrl+o`: load JSON config file into editor
 - `ctrl+x`: cancel active run
 - `tab` / `shift+tab`: cycle focus panes
 - `up` / `down` or mouse wheel: scroll focused pane
@@ -446,6 +454,69 @@ go run ./cmd/blackswan-tui
   - `gpu.scenario_chunk_size`, `gpu.fraction_tile_size`
   - `gpu.max_vram_utilization`
   - `gpu.fallback_to_cpu_on_error`
+- Retirement modeling:
+  - `portfolio.retirement.enabled`
+  - `portfolio.retirement.start_month_from_start`
+  - `portfolio.retirement.safe_withdrawal_rate_annual`
+  - `portfolio.retirement.expense_reduction_fraction`
+  - `portfolio.retirement.dynamic_safe_withdrawal_rate`
+- Crash-recovery reinvestment:
+  - `portfolio.crash_reinvestment.enabled`
+  - `portfolio.crash_reinvestment.crash_drawdown_threshold`
+  - `portfolio.crash_reinvestment.recovery_fraction_of_peak`
+  - `portfolio.crash_reinvestment.reinvest_fraction_of_initial_sale_proceeds`
+  - `portfolio.crash_reinvestment.cash_buffer_months`
+
+### Retirement Mode
+
+Retirement mode lets you model a switch from employment income to portfolio-funded living expenses at a specific month in the simulation.
+
+Key fields:
+
+- `portfolio.retirement.enabled`: turn retirement logic on/off.
+- `portfolio.retirement.start_month_from_start`: 0-based month index when retirement starts (`0` means retirement is active from the first simulated month).
+- `portfolio.retirement.expense_reduction_fraction`: multiplies pre-retirement monthly expenses after retirement (for example, `0.8` means 80% of original expenses).
+- `portfolio.retirement.dynamic_safe_withdrawal_rate`:
+  - `false`: fixed SWR mode
+  - `true`: dynamic withdrawal mode
+- `portfolio.retirement.safe_withdrawal_rate_annual`: annual SWR used in fixed mode (`monthly_rate = annual_rate / 12`).
+
+Behavior after retirement starts:
+
+- Employment is forced to unemployed for all remaining months.
+- Monthly expenses are reduced to `monthly_expenses * expense_reduction_fraction`.
+- Portfolio withdrawals:
+  - Fixed mode (`dynamic_safe_withdrawal_rate=false`): withdraw stock proceeds using `safe_withdrawal_rate_annual / 12` of current stock value each month.
+  - Dynamic mode (`dynamic_safe_withdrawal_rate=true`): withdraw only what is needed to cover the reduced monthly expense.
+
+Example:
+
+```json
+{
+  "portfolio": {
+    "monthly_expenses": 10000.0,
+    "retirement": {
+      "enabled": true,
+      "start_month_from_start": 48,
+      "safe_withdrawal_rate_annual": 0.04,
+      "expense_reduction_fraction": 0.8,
+      "dynamic_safe_withdrawal_rate": true
+    }
+  }
+}
+```
+
+### Crash-Recovery Reinvestment semantics
+
+- Reinvestment trigger is drawdown-based:
+  - a crash state starts when market index drawdown from running peak reaches `crash_drawdown_threshold`
+  - reinvestment becomes eligible when the index recovers to `recovery_fraction_of_peak` of that pre-crash peak
+- Reinvestment runs at most once per scenario path.
+- Reinvestment amount is limited by:
+  - `reinvest_fraction_of_initial_sale_proceeds` applied to remaining tracked initial-sale proceeds
+  - currently available cash
+  - an emergency cash floor: `cash_buffer_months * current_monthly_expense`
+- Works with or without retirement enabled.
 
 ### Distribution specs for beliefs
 
@@ -511,10 +582,14 @@ Top-level result keys:
 - `diagnostics_by_fraction`
 - `universe_summary`
 - `execution`
+- `retirement`
+- `reinvestment`
 
 Execution metadata includes:
 
 - universal fields: `mode`, `workers_used`, `backend`, `start_method`, `fraction_tasks`, `fallback_reason`
+- retirement metadata in both `result["retirement"]` and `result["execution"]["retirement"]`
+- reinvestment metadata in both `result["reinvestment"]` and `result["execution"]["reinvestment"]`
 - streaming/CUDA fields when applicable: `gpu_name`, `driver_version`, `device_memory_total_mb`, `device_memory_free_mb`, `chunk_size_used`, `fraction_tile_used`, `precision_mode`, `cvar_mode`, `kernel_time_ms`, `transfer_time_ms`, `reduction_time_ms`
 
 ## Troubleshooting
@@ -562,6 +637,8 @@ pytest -q
 Coverage includes:
 
 - config validation
+- retirement behavior and retirement config validation
+- crash-recovery reinvestment behavior and config validation
 - objective smoke tests
 - single vs parallel consistency
 - consensus outputs

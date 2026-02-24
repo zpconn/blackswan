@@ -10,7 +10,11 @@ struct SyntheticGenerationParams {
     double sigma;
     double monthly_market_drift;
 
-    double prob_crash;
+    int prob_crash_mode;
+    double prob_crash_a;
+    double prob_crash_b;
+    double prob_crash_c;
+    double prob_crash_d;
 
     int crash_start_mode;
     double crash_start_a;
@@ -47,6 +51,16 @@ void launch_simulate_fraction_tile(
     double ltcg_tax_rate,
     double monthly_expenses,
     double monthly_savings,
+    int retirement_enabled,
+    int retirement_start_month_from_start,
+    double retirement_safe_withdrawal_rate_annual,
+    double retirement_expense_reduction_fraction,
+    int retirement_dynamic_safe_withdrawal_rate,
+    int reinvest_enabled,
+    double reinvest_crash_drawdown_threshold,
+    double reinvest_recovery_fraction_of_peak,
+    double reinvest_fraction_of_initial_sale_proceeds,
+    int reinvest_cash_buffer_months,
     double cash_yield_annual,
     double* out_final_net_worth,
     std::uint8_t* out_ruined
@@ -65,6 +79,16 @@ void launch_simulate_fraction_tile_aggregates(
     double ltcg_tax_rate,
     double monthly_expenses,
     double monthly_savings,
+    int retirement_enabled,
+    int retirement_start_month_from_start,
+    double retirement_safe_withdrawal_rate_annual,
+    double retirement_expense_reduction_fraction,
+    int retirement_dynamic_safe_withdrawal_rate,
+    int reinvest_enabled,
+    double reinvest_crash_drawdown_threshold,
+    double reinvest_recovery_fraction_of_peak,
+    double reinvest_fraction_of_initial_sale_proceeds,
+    int reinvest_cash_buffer_months,
     double cash_yield_annual,
     double log_utility_wealth_floor,
     const int* sample_map,
@@ -111,6 +135,16 @@ void launch_simulate_fraction_tile_aggregates_from_params(
     double ltcg_tax_rate,
     double monthly_expenses,
     double monthly_savings,
+    int retirement_enabled,
+    int retirement_start_month_from_start,
+    double retirement_safe_withdrawal_rate_annual,
+    double retirement_expense_reduction_fraction,
+    int retirement_dynamic_safe_withdrawal_rate,
+    int reinvest_enabled,
+    double reinvest_crash_drawdown_threshold,
+    double reinvest_recovery_fraction_of_peak,
+    double reinvest_fraction_of_initial_sale_proceeds,
+    int reinvest_cash_buffer_months,
     double cash_yield_annual,
     double log_utility_wealth_floor,
     const int* sample_map,
@@ -140,6 +174,16 @@ void launch_simulate_fraction_tile_full_from_params(
     double ltcg_tax_rate,
     double monthly_expenses,
     double monthly_savings,
+    int retirement_enabled,
+    int retirement_start_month_from_start,
+    double retirement_safe_withdrawal_rate_annual,
+    double retirement_expense_reduction_fraction,
+    int retirement_dynamic_safe_withdrawal_rate,
+    int reinvest_enabled,
+    double reinvest_crash_drawdown_threshold,
+    double reinvest_recovery_fraction_of_peak,
+    double reinvest_fraction_of_initial_sale_proceeds,
+    int reinvest_cash_buffer_months,
     double cash_yield_annual,
     double* out_final_net_worth,
     std::uint8_t* out_ruined,

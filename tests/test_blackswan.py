@@ -26,6 +26,25 @@ def _base_config():
     }
 
 
+def _deterministic_universe(horizon_months, monthly_return=0.0, unemployed=False):
+    return {
+        "n_sims": 1,
+        "horizon_months": horizon_months,
+        "monthly_returns": np.full((1, horizon_months), monthly_return, dtype=np.float64),
+        "unemployment_matrix": np.full((1, horizon_months), unemployed, dtype=bool),
+    }
+
+
+def _custom_universe(monthly_returns, unemployed=False):
+    monthly_returns = np.asarray(monthly_returns, dtype=np.float64).reshape(1, -1)
+    return {
+        "n_sims": 1,
+        "horizon_months": int(monthly_returns.shape[1]),
+        "monthly_returns": monthly_returns,
+        "unemployment_matrix": np.full((1, monthly_returns.shape[1]), unemployed, dtype=bool),
+    }
+
+
 def _assert_core_result_shape(result, expected_points):
     assert "recommended_fraction" in result
     assert "objective_score" in result
@@ -94,6 +113,348 @@ def test_validate_config_rejects_invalid_gpu_settings(override):
     config = optimizer._deep_merge(optimizer.DEFAULT_CONFIG, override)
     with pytest.raises(ValueError):
         optimizer.validate_config(config)
+
+
+@pytest.mark.parametrize(
+    "override,match",
+    [
+        (
+            {"portfolio": {"retirement": {"enabled": True, "start_month_from_start": None}}},
+            "start_month_from_start is required",
+        ),
+        (
+            {"portfolio": {"retirement": {"start_month_from_start": -1}}},
+            "start_month_from_start must be >= 0",
+        ),
+        (
+            {"portfolio": {"retirement": {"expense_reduction_fraction": 1.2}}},
+            r"expense_reduction_fraction must be in \[0, 1\]",
+        ),
+        (
+            {"portfolio": {"retirement": {"dynamic_safe_withdrawal_rate": "yes"}}},
+            "dynamic_safe_withdrawal_rate must be a bool",
+        ),
+    ],
+)
+def test_validate_config_rejects_invalid_retirement_settings(override, match):
+    config = optimizer._deep_merge(optimizer.DEFAULT_CONFIG, override)
+    with pytest.raises(ValueError, match=match):
+        optimizer.validate_config(config)
+
+
+@pytest.mark.parametrize(
+    "override,match",
+    [
+        (
+            {"portfolio": {"crash_reinvestment": {"crash_drawdown_threshold": 0.0}}},
+            r"crash_drawdown_threshold must be in \(0, 1\)",
+        ),
+        (
+            {"portfolio": {"crash_reinvestment": {"recovery_fraction_of_peak": 1.2}}},
+            r"recovery_fraction_of_peak must be in \(0, 1\]",
+        ),
+        (
+            {"portfolio": {"crash_reinvestment": {"reinvest_fraction_of_initial_sale_proceeds": 1.2}}},
+            r"reinvest_fraction_of_initial_sale_proceeds must be in \[0, 1\]",
+        ),
+        (
+            {"portfolio": {"crash_reinvestment": {"cash_buffer_months": True}}},
+            r"cash_buffer_months must be an int >= 0",
+        ),
+    ],
+)
+def test_validate_config_rejects_invalid_crash_reinvestment_settings(override, match):
+    config = optimizer._deep_merge(optimizer.DEFAULT_CONFIG, override)
+    with pytest.raises(ValueError, match=match):
+        optimizer.validate_config(config)
+
+
+def test_retirement_forces_permanent_unemployment_after_start():
+    universe = _deterministic_universe(horizon_months=3, monthly_return=0.0, unemployed=False)
+    base = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "portfolio": {
+                "initial_portfolio": 1_000.0,
+                "initial_basis": 1_000.0,
+                "ltcg_tax_rate": 0.0,
+                "monthly_expenses": 0.0,
+                "monthly_savings": 100.0,
+            },
+            "market": {"cash_yield_annual": 0.0},
+        },
+    )
+    no_retirement_cfg = optimizer._deep_merge(base, {"portfolio": {"retirement": {"enabled": False}}})
+    retirement_cfg = optimizer._deep_merge(
+        base,
+        {
+            "portfolio": {
+                "retirement": {
+                    "enabled": True,
+                    "start_month_from_start": 1,
+                    "safe_withdrawal_rate_annual": 0.0,
+                    "expense_reduction_fraction": 1.0,
+                    "dynamic_safe_withdrawal_rate": False,
+                }
+            }
+        },
+    )
+
+    baseline_final, baseline_ruined = optimizer._simulate_strategy_fraction(0.0, universe, no_retirement_cfg)
+    retired_final, retired_ruined = optimizer._simulate_strategy_fraction(0.0, universe, retirement_cfg)
+
+    assert not baseline_ruined[0]
+    assert not retired_ruined[0]
+    assert math.isclose(baseline_final[0], 1_300.0, rel_tol=0.0, abs_tol=1e-9)
+    assert math.isclose(retired_final[0], 1_100.0, rel_tol=0.0, abs_tol=1e-9)
+
+
+def test_retirement_applies_expenses_every_month_after_start():
+    universe = _deterministic_universe(horizon_months=3, monthly_return=0.0, unemployed=False)
+    base = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "portfolio": {
+                "initial_portfolio": 120.0,
+                "initial_basis": 120.0,
+                "ltcg_tax_rate": 0.0,
+                "monthly_expenses": 50.0,
+                "monthly_savings": 0.0,
+            },
+            "market": {"cash_yield_annual": 0.0},
+        },
+    )
+    no_retirement_cfg = optimizer._deep_merge(base, {"portfolio": {"retirement": {"enabled": False}}})
+    retirement_cfg = optimizer._deep_merge(
+        base,
+        {
+            "portfolio": {
+                "retirement": {
+                    "enabled": True,
+                    "start_month_from_start": 1,
+                    "safe_withdrawal_rate_annual": 0.0,
+                    "expense_reduction_fraction": 1.0,
+                    "dynamic_safe_withdrawal_rate": False,
+                }
+            }
+        },
+    )
+
+    baseline_final, baseline_ruined = optimizer._simulate_strategy_fraction(1.0, universe, no_retirement_cfg)
+    retired_final, retired_ruined = optimizer._simulate_strategy_fraction(1.0, universe, retirement_cfg)
+
+    assert not baseline_ruined[0]
+    assert not retired_ruined[0]
+    assert math.isclose(baseline_final[0], 120.0, rel_tol=0.0, abs_tol=1e-9)
+    assert math.isclose(retired_final[0], 20.0, rel_tol=0.0, abs_tol=1e-9)
+
+
+def test_dynamic_retirement_withdrawal_matches_reduced_expenses():
+    universe = _deterministic_universe(horizon_months=2, monthly_return=0.0, unemployed=False)
+    fixed_cfg = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "portfolio": {
+                "initial_portfolio": 1_000.0,
+                "initial_basis": 1_000.0,
+                "ltcg_tax_rate": 0.0,
+                "monthly_expenses": 100.0,
+                "monthly_savings": 0.0,
+                "retirement": {
+                    "enabled": True,
+                    "start_month_from_start": 0,
+                    "safe_withdrawal_rate_annual": 1.2,
+                    "expense_reduction_fraction": 0.7,
+                    "dynamic_safe_withdrawal_rate": False,
+                },
+            },
+            "market": {"cash_yield_annual": 0.12},
+        },
+    )
+    dynamic_cfg = optimizer._deep_merge(
+        fixed_cfg,
+        {"portfolio": {"retirement": {"dynamic_safe_withdrawal_rate": True}}},
+    )
+
+    fixed_final, fixed_ruined = optimizer._simulate_strategy_fraction(0.0, universe, fixed_cfg)
+    dynamic_final, dynamic_ruined = optimizer._simulate_strategy_fraction(0.0, universe, dynamic_cfg)
+
+    assert not fixed_ruined[0]
+    assert not dynamic_ruined[0]
+    assert math.isclose(fixed_final[0], 860.3, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(dynamic_final[0], 860.0, rel_tol=0.0, abs_tol=1e-6)
+    assert dynamic_final[0] < fixed_final[0]
+
+
+def test_crash_reinvestment_triggers_after_recovery():
+    universe = _custom_universe([-0.30, 0.20, 0.10, 0.10], unemployed=False)
+    base = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "portfolio": {
+                "initial_portfolio": 100.0,
+                "initial_basis": 100.0,
+                "ltcg_tax_rate": 0.0,
+                "monthly_expenses": 0.0,
+                "monthly_savings": 0.0,
+                "crash_reinvestment": {
+                    "enabled": True,
+                    "crash_drawdown_threshold": 0.20,
+                    "recovery_fraction_of_peak": 0.90,
+                    "reinvest_fraction_of_initial_sale_proceeds": 1.0,
+                    "cash_buffer_months": 0,
+                },
+            },
+            "market": {"cash_yield_annual": 0.0},
+        },
+    )
+    disabled = optimizer._deep_merge(base, {"portfolio": {"crash_reinvestment": {"enabled": False}}})
+
+    with_reinvest, ruined_with = optimizer._simulate_strategy_fraction(1.0, universe, base)
+    without_reinvest, ruined_without = optimizer._simulate_strategy_fraction(1.0, universe, disabled)
+
+    assert not ruined_with[0]
+    assert not ruined_without[0]
+    assert with_reinvest[0] > without_reinvest[0] + 5.0
+
+
+def test_crash_reinvestment_does_not_trigger_without_required_drawdown():
+    universe = _custom_universe([-0.10, 0.05, 0.05, 0.05], unemployed=False)
+    base = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "portfolio": {
+                "initial_portfolio": 100.0,
+                "initial_basis": 100.0,
+                "ltcg_tax_rate": 0.0,
+                "monthly_expenses": 0.0,
+                "monthly_savings": 0.0,
+                "crash_reinvestment": {
+                    "enabled": True,
+                    "crash_drawdown_threshold": 0.20,
+                    "recovery_fraction_of_peak": 0.90,
+                    "reinvest_fraction_of_initial_sale_proceeds": 1.0,
+                    "cash_buffer_months": 0,
+                },
+            },
+            "market": {"cash_yield_annual": 0.0},
+        },
+    )
+    disabled = optimizer._deep_merge(base, {"portfolio": {"crash_reinvestment": {"enabled": False}}})
+
+    with_reinvest, _ = optimizer._simulate_strategy_fraction(1.0, universe, base)
+    without_reinvest, _ = optimizer._simulate_strategy_fraction(1.0, universe, disabled)
+
+    assert math.isclose(with_reinvest[0], without_reinvest[0], rel_tol=0.0, abs_tol=1e-9)
+
+
+def test_crash_reinvestment_respects_cash_buffer():
+    universe = _custom_universe([-0.30, 0.20, 0.10, 0.10], unemployed=False)
+    base = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "portfolio": {
+                "initial_portfolio": 100.0,
+                "initial_basis": 100.0,
+                "ltcg_tax_rate": 0.0,
+                "monthly_expenses": 20.0,
+                "monthly_savings": 0.0,
+                "crash_reinvestment": {
+                    "enabled": True,
+                    "crash_drawdown_threshold": 0.20,
+                    "recovery_fraction_of_peak": 0.90,
+                    "reinvest_fraction_of_initial_sale_proceeds": 1.0,
+                    "cash_buffer_months": 10,
+                },
+            },
+            "market": {"cash_yield_annual": 0.0},
+        },
+    )
+    disabled = optimizer._deep_merge(base, {"portfolio": {"crash_reinvestment": {"enabled": False}}})
+
+    with_reinvest, _ = optimizer._simulate_strategy_fraction(1.0, universe, base)
+    without_reinvest, _ = optimizer._simulate_strategy_fraction(1.0, universe, disabled)
+
+    assert math.isclose(with_reinvest[0], without_reinvest[0], rel_tol=0.0, abs_tol=1e-9)
+
+
+def test_crash_reinvestment_runs_once_per_path():
+    universe = _custom_universe([-0.30, 0.40, -0.30, 0.40, 0.10], unemployed=False)
+    cfg = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "portfolio": {
+                "initial_portfolio": 100.0,
+                "initial_basis": 100.0,
+                "ltcg_tax_rate": 0.0,
+                "monthly_expenses": 0.0,
+                "monthly_savings": 0.0,
+                "crash_reinvestment": {
+                    "enabled": True,
+                    "crash_drawdown_threshold": 0.20,
+                    "recovery_fraction_of_peak": 0.90,
+                    "reinvest_fraction_of_initial_sale_proceeds": 0.5,
+                    "cash_buffer_months": 0,
+                },
+            },
+            "market": {"cash_yield_annual": 0.0},
+        },
+    )
+
+    final_net_worth, ruined = optimizer._simulate_strategy_fraction(1.0, universe, cfg)
+    assert not ruined[0]
+    assert 103.0 < final_net_worth[0] < 105.0
+
+
+def test_crash_reinvestment_works_with_retirement_enabled():
+    universe = _custom_universe([-0.30, 0.20, 0.10, 0.10], unemployed=False)
+    base = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "portfolio": {
+                "initial_portfolio": 100.0,
+                "initial_basis": 100.0,
+                "ltcg_tax_rate": 0.0,
+                "monthly_expenses": 0.0,
+                "monthly_savings": 10.0,
+                "retirement": {
+                    "enabled": True,
+                    "start_month_from_start": 0,
+                    "safe_withdrawal_rate_annual": 0.0,
+                    "expense_reduction_fraction": 0.8,
+                    "dynamic_safe_withdrawal_rate": False,
+                },
+                "crash_reinvestment": {
+                    "enabled": True,
+                    "crash_drawdown_threshold": 0.20,
+                    "recovery_fraction_of_peak": 0.90,
+                    "reinvest_fraction_of_initial_sale_proceeds": 1.0,
+                    "cash_buffer_months": 0,
+                },
+            },
+            "market": {"cash_yield_annual": 0.0},
+        },
+    )
+    disabled = optimizer._deep_merge(base, {"portfolio": {"crash_reinvestment": {"enabled": False}}})
+
+    with_reinvest, ruined_with = optimizer._simulate_strategy_fraction(1.0, universe, base)
+    without_reinvest, ruined_without = optimizer._simulate_strategy_fraction(1.0, universe, disabled)
+
+    assert not ruined_with[0]
+    assert not ruined_without[0]
+    assert with_reinvest[0] > without_reinvest[0] + 5.0
+
+
+def test_run_result_includes_reinvestment_metadata():
+    cfg = _base_config()
+    cfg["portfolio"] = {
+        "crash_reinvestment": {
+            "enabled": True,
+        }
+    }
+    result = optimizer.run_monte_carlo_optimization(config=cfg, verbose=False)
+    assert result["reinvestment"]["enabled"] is True
+    assert result["execution"]["reinvestment"]["frequency"] == "once_per_path"
 
 
 @pytest.mark.parametrize("objective_mode", sorted(optimizer.SUPPORTED_OBJECTIVES))
@@ -305,6 +666,70 @@ def test_gpu_extension_fallback_to_cpu_when_unavailable(monkeypatch):
     result = optimizer.run_monte_carlo_optimization(config=cfg, verbose=False)
     assert result["execution"]["backend"] == "numpy_streaming"
     assert "forced missing extension" in result["execution"]["fallback_reason"]
+
+
+def test_synthetic_generation_params_support_beta_prob_crash():
+    cfg = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "beliefs": {
+                "prob_crash": {
+                    "dist": "beta",
+                    "a": 3.0,
+                    "b": 4.0,
+                    "low": 0.15,
+                    "high": 0.75,
+                }
+            }
+        },
+    )
+
+    params = optimizer._build_synthetic_generation_params(cfg, horizon_months=120, chunk_start=0)
+    assert params is not None
+    assert params["prob_crash_mode"] == 3
+    assert math.isclose(params["prob_crash_a"], 3.0)
+    assert math.isclose(params["prob_crash_b"], 4.0)
+    assert math.isclose(params["prob_crash_c"], 0.15)
+    assert math.isclose(params["prob_crash_d"], 0.75)
+
+
+def test_can_use_device_scenario_generation_accepts_beta_prob_crash(monkeypatch):
+    monkeypatch.setattr(optimizer.gpu_backend, "load_cuda_extension", lambda: object())
+    monkeypatch.setattr(optimizer.gpu_backend, "supports_synthetic_generation", lambda ext: True)
+
+    cfg = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "beliefs": {
+                "prob_crash": {
+                    "dist": "beta",
+                    "a": 2.0,
+                    "b": 5.0,
+                    "low": 0.05,
+                    "high": 0.8,
+                }
+            }
+        },
+    )
+    assert optimizer._can_use_device_scenario_generation(cfg, use_cuda_backend=True)
+
+
+def test_synthetic_generation_params_reject_unsupported_prob_crash_distribution():
+    cfg = optimizer._deep_merge(
+        optimizer.DEFAULT_CONFIG,
+        {
+            "beliefs": {
+                "prob_crash": {
+                    "dist": "lognormal",
+                    "mean": -3.0,
+                    "sigma": 0.5,
+                    "clip_low": 0.0,
+                    "clip_high": 1.0,
+                }
+            }
+        },
+    )
+    assert optimizer._build_synthetic_generation_params(cfg, horizon_months=120, chunk_start=0) is None
 
 
 def test_numpy_streaming_backend_runs_when_cuda_not_required():

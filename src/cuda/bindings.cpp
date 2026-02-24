@@ -37,7 +37,22 @@ SyntheticGenerationParams parse_synthetic_params(const py::dict& params_dict) {
     params.horizon = dict_get_required<int>(params_dict, "horizon");
     params.sigma = dict_get_required<double>(params_dict, "sigma");
     params.monthly_market_drift = dict_get_required<double>(params_dict, "monthly_market_drift");
-    params.prob_crash = dict_get_required<double>(params_dict, "prob_crash");
+    py::str prob_mode_key("prob_crash_mode");
+    if (params_dict.contains(prob_mode_key)) {
+        params.prob_crash_mode = dict_get_required<int>(params_dict, "prob_crash_mode");
+        params.prob_crash_a = dict_get_required<double>(params_dict, "prob_crash_a");
+        params.prob_crash_b = dict_get_required<double>(params_dict, "prob_crash_b");
+        params.prob_crash_c = dict_get_required<double>(params_dict, "prob_crash_c");
+        params.prob_crash_d = dict_get_required<double>(params_dict, "prob_crash_d");
+    } else {
+        // Backward compatibility for older Python callers.
+        double scalar_prob_crash = dict_get_required<double>(params_dict, "prob_crash");
+        params.prob_crash_mode = 0;
+        params.prob_crash_a = scalar_prob_crash;
+        params.prob_crash_b = scalar_prob_crash;
+        params.prob_crash_c = scalar_prob_crash;
+        params.prob_crash_d = scalar_prob_crash;
+    }
 
     params.crash_start_mode = dict_get_required<int>(params_dict, "crash_start_mode");
     params.crash_start_a = dict_get_required<double>(params_dict, "crash_start_a");
@@ -142,6 +157,16 @@ std::pair<py::array_t<double>, py::array_t<std::uint8_t>> simulate_fraction_tile
     double ltcg_tax_rate,
     double monthly_expenses,
     double monthly_savings,
+    int retirement_enabled,
+    int retirement_start_month_from_start,
+    double retirement_safe_withdrawal_rate_annual,
+    double retirement_expense_reduction_fraction,
+    int retirement_dynamic_safe_withdrawal_rate,
+    int reinvest_enabled,
+    double reinvest_crash_drawdown_threshold,
+    double reinvest_recovery_fraction_of_peak,
+    double reinvest_fraction_of_initial_sale_proceeds,
+    int reinvest_cash_buffer_months,
     double cash_yield_annual
 ) {
     auto returns_info = monthly_returns.request();
@@ -223,6 +248,16 @@ std::pair<py::array_t<double>, py::array_t<std::uint8_t>> simulate_fraction_tile
             ltcg_tax_rate,
             monthly_expenses,
             monthly_savings,
+            retirement_enabled,
+            retirement_start_month_from_start,
+            retirement_safe_withdrawal_rate_annual,
+            retirement_expense_reduction_fraction,
+            retirement_dynamic_safe_withdrawal_rate,
+            reinvest_enabled,
+            reinvest_crash_drawdown_threshold,
+            reinvest_recovery_fraction_of_peak,
+            reinvest_fraction_of_initial_sale_proceeds,
+            reinvest_cash_buffer_months,
             cash_yield_annual,
             d_final,
             d_ruined
@@ -266,6 +301,16 @@ py::tuple simulate_fraction_tile_aggregates(
     double ltcg_tax_rate,
     double monthly_expenses,
     double monthly_savings,
+    int retirement_enabled,
+    int retirement_start_month_from_start,
+    double retirement_safe_withdrawal_rate_annual,
+    double retirement_expense_reduction_fraction,
+    int retirement_dynamic_safe_withdrawal_rate,
+    int reinvest_enabled,
+    double reinvest_crash_drawdown_threshold,
+    double reinvest_recovery_fraction_of_peak,
+    double reinvest_fraction_of_initial_sale_proceeds,
+    int reinvest_cash_buffer_months,
     double cash_yield_annual,
     double log_utility_wealth_floor,
     py::object sample_positions_obj,
@@ -443,6 +488,16 @@ py::tuple simulate_fraction_tile_aggregates(
                 ltcg_tax_rate,
                 monthly_expenses,
                 monthly_savings,
+                retirement_enabled,
+                retirement_start_month_from_start,
+                retirement_safe_withdrawal_rate_annual,
+                retirement_expense_reduction_fraction,
+                retirement_dynamic_safe_withdrawal_rate,
+                reinvest_enabled,
+                reinvest_crash_drawdown_threshold,
+                reinvest_recovery_fraction_of_peak,
+                reinvest_fraction_of_initial_sale_proceeds,
+                reinvest_cash_buffer_months,
                 cash_yield_annual,
                 log_utility_wealth_floor,
                 d_sample_map,
@@ -507,6 +562,16 @@ py::tuple simulate_fraction_tile_aggregates_synthetic(
     double ltcg_tax_rate,
     double monthly_expenses,
     double monthly_savings,
+    int retirement_enabled,
+    int retirement_start_month_from_start,
+    double retirement_safe_withdrawal_rate_annual,
+    double retirement_expense_reduction_fraction,
+    int retirement_dynamic_safe_withdrawal_rate,
+    int reinvest_enabled,
+    double reinvest_crash_drawdown_threshold,
+    double reinvest_recovery_fraction_of_peak,
+    double reinvest_fraction_of_initial_sale_proceeds,
+    int reinvest_cash_buffer_months,
     double cash_yield_annual,
     double log_utility_wealth_floor,
     py::dict synthetic_params,
@@ -690,6 +755,16 @@ py::tuple simulate_fraction_tile_aggregates_synthetic(
                 ltcg_tax_rate,
                 monthly_expenses,
                 monthly_savings,
+                retirement_enabled,
+                retirement_start_month_from_start,
+                retirement_safe_withdrawal_rate_annual,
+                retirement_expense_reduction_fraction,
+                retirement_dynamic_safe_withdrawal_rate,
+                reinvest_enabled,
+                reinvest_crash_drawdown_threshold,
+                reinvest_recovery_fraction_of_peak,
+                reinvest_fraction_of_initial_sale_proceeds,
+                reinvest_cash_buffer_months,
                 cash_yield_annual,
                 log_utility_wealth_floor,
                 d_sample_map,
@@ -743,6 +818,16 @@ py::tuple simulate_fraction_tile_synthetic(
     double ltcg_tax_rate,
     double monthly_expenses,
     double monthly_savings,
+    int retirement_enabled,
+    int retirement_start_month_from_start,
+    double retirement_safe_withdrawal_rate_annual,
+    double retirement_expense_reduction_fraction,
+    int retirement_dynamic_safe_withdrawal_rate,
+    int reinvest_enabled,
+    double reinvest_crash_drawdown_threshold,
+    double reinvest_recovery_fraction_of_peak,
+    double reinvest_fraction_of_initial_sale_proceeds,
+    int reinvest_cash_buffer_months,
     double cash_yield_annual,
     py::dict synthetic_params,
     int streams
@@ -843,6 +928,16 @@ py::tuple simulate_fraction_tile_synthetic(
             ltcg_tax_rate,
             monthly_expenses,
             monthly_savings,
+            retirement_enabled,
+            retirement_start_month_from_start,
+            retirement_safe_withdrawal_rate_annual,
+            retirement_expense_reduction_fraction,
+            retirement_dynamic_safe_withdrawal_rate,
+            reinvest_enabled,
+            reinvest_crash_drawdown_threshold,
+            reinvest_recovery_fraction_of_peak,
+            reinvest_fraction_of_initial_sale_proceeds,
+            reinvest_cash_buffer_months,
             cash_yield_annual,
             d_final,
             d_ruined,
@@ -882,6 +977,16 @@ PYBIND11_MODULE(blackswan_cuda, m) {
         py::arg("ltcg_tax_rate"),
         py::arg("monthly_expenses"),
         py::arg("monthly_savings"),
+        py::arg("retirement_enabled"),
+        py::arg("retirement_start_month_from_start"),
+        py::arg("retirement_safe_withdrawal_rate_annual"),
+        py::arg("retirement_expense_reduction_fraction"),
+        py::arg("retirement_dynamic_safe_withdrawal_rate"),
+        py::arg("reinvest_enabled"),
+        py::arg("reinvest_crash_drawdown_threshold"),
+        py::arg("reinvest_recovery_fraction_of_peak"),
+        py::arg("reinvest_fraction_of_initial_sale_proceeds"),
+        py::arg("reinvest_cash_buffer_months"),
         py::arg("cash_yield_annual")
     );
     m.def(
@@ -895,6 +1000,16 @@ PYBIND11_MODULE(blackswan_cuda, m) {
         py::arg("ltcg_tax_rate"),
         py::arg("monthly_expenses"),
         py::arg("monthly_savings"),
+        py::arg("retirement_enabled"),
+        py::arg("retirement_start_month_from_start"),
+        py::arg("retirement_safe_withdrawal_rate_annual"),
+        py::arg("retirement_expense_reduction_fraction"),
+        py::arg("retirement_dynamic_safe_withdrawal_rate"),
+        py::arg("reinvest_enabled"),
+        py::arg("reinvest_crash_drawdown_threshold"),
+        py::arg("reinvest_recovery_fraction_of_peak"),
+        py::arg("reinvest_fraction_of_initial_sale_proceeds"),
+        py::arg("reinvest_cash_buffer_months"),
         py::arg("cash_yield_annual"),
         py::arg("log_utility_wealth_floor"),
         py::arg("sample_positions") = py::none(),
@@ -910,6 +1025,16 @@ PYBIND11_MODULE(blackswan_cuda, m) {
         py::arg("ltcg_tax_rate"),
         py::arg("monthly_expenses"),
         py::arg("monthly_savings"),
+        py::arg("retirement_enabled"),
+        py::arg("retirement_start_month_from_start"),
+        py::arg("retirement_safe_withdrawal_rate_annual"),
+        py::arg("retirement_expense_reduction_fraction"),
+        py::arg("retirement_dynamic_safe_withdrawal_rate"),
+        py::arg("reinvest_enabled"),
+        py::arg("reinvest_crash_drawdown_threshold"),
+        py::arg("reinvest_recovery_fraction_of_peak"),
+        py::arg("reinvest_fraction_of_initial_sale_proceeds"),
+        py::arg("reinvest_cash_buffer_months"),
         py::arg("cash_yield_annual"),
         py::arg("log_utility_wealth_floor"),
         py::arg("synthetic_params"),
@@ -926,6 +1051,16 @@ PYBIND11_MODULE(blackswan_cuda, m) {
         py::arg("ltcg_tax_rate"),
         py::arg("monthly_expenses"),
         py::arg("monthly_savings"),
+        py::arg("retirement_enabled"),
+        py::arg("retirement_start_month_from_start"),
+        py::arg("retirement_safe_withdrawal_rate_annual"),
+        py::arg("retirement_expense_reduction_fraction"),
+        py::arg("retirement_dynamic_safe_withdrawal_rate"),
+        py::arg("reinvest_enabled"),
+        py::arg("reinvest_crash_drawdown_threshold"),
+        py::arg("reinvest_recovery_fraction_of_peak"),
+        py::arg("reinvest_fraction_of_initial_sale_proceeds"),
+        py::arg("reinvest_cash_buffer_months"),
         py::arg("cash_yield_annual"),
         py::arg("synthetic_params"),
         py::arg("streams") = 1

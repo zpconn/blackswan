@@ -9,6 +9,33 @@ class GpuBackendError(RuntimeError):
     pass
 
 
+def _retirement_kernel_args(portfolio_config):
+    retirement = (portfolio_config or {}).get("retirement") or {}
+    enabled = bool(retirement.get("enabled", False))
+    start_month = retirement.get("start_month_from_start")
+    if start_month is None:
+        start_month = -1
+
+    return (
+        int(enabled),
+        int(start_month),
+        float(retirement.get("safe_withdrawal_rate_annual", 0.04)),
+        float(retirement.get("expense_reduction_fraction", 1.0)),
+        int(bool(retirement.get("dynamic_safe_withdrawal_rate", False))),
+    )
+
+
+def _reinvestment_kernel_args(portfolio_config):
+    reinvest = (portfolio_config or {}).get("crash_reinvestment") or {}
+    return (
+        int(bool(reinvest.get("enabled", False))),
+        float(reinvest.get("crash_drawdown_threshold", 0.20)),
+        float(reinvest.get("recovery_fraction_of_peak", 0.90)),
+        float(reinvest.get("reinvest_fraction_of_initial_sale_proceeds", 1.0)),
+        int(reinvest.get("cash_buffer_months", 12)),
+    )
+
+
 def _parse_nvidia_smi_line(line):
     parts = [part.strip() for part in line.split(",")]
     if len(parts) != 4:
@@ -73,6 +100,20 @@ def _simulate_fraction_tile_legacy(
     portfolio_config,
     market_config,
 ):
+    (
+        retirement_enabled,
+        retirement_start_month_from_start,
+        retirement_safe_withdrawal_rate_annual,
+        retirement_expense_reduction_fraction,
+        retirement_dynamic_safe_withdrawal_rate,
+    ) = _retirement_kernel_args(portfolio_config)
+    (
+        reinvest_enabled,
+        reinvest_crash_drawdown_threshold,
+        reinvest_recovery_fraction_of_peak,
+        reinvest_fraction_of_initial_sale_proceeds,
+        reinvest_cash_buffer_months,
+    ) = _reinvestment_kernel_args(portfolio_config)
     t0 = time.perf_counter()
     try:
         final_net_worth, ruined = ext.simulate_fraction_tile(
@@ -84,6 +125,16 @@ def _simulate_fraction_tile_legacy(
             float(portfolio_config["ltcg_tax_rate"]),
             float(portfolio_config["monthly_expenses"]),
             float(portfolio_config["monthly_savings"]),
+            retirement_enabled,
+            retirement_start_month_from_start,
+            retirement_safe_withdrawal_rate_annual,
+            retirement_expense_reduction_fraction,
+            retirement_dynamic_safe_withdrawal_rate,
+            reinvest_enabled,
+            reinvest_crash_drawdown_threshold,
+            reinvest_recovery_fraction_of_peak,
+            reinvest_fraction_of_initial_sale_proceeds,
+            reinvest_cash_buffer_months,
             float(market_config["cash_yield_annual"]),
         )
     except Exception as exc:
@@ -125,6 +176,20 @@ def simulate_fraction_tile_aggregates(
     monthly_returns = np.ascontiguousarray(monthly_returns, dtype=np.float32)
     unemployment_matrix = np.ascontiguousarray(unemployment_matrix, dtype=np.uint8)
     fractions = np.ascontiguousarray(fractions, dtype=np.float64)
+    (
+        retirement_enabled,
+        retirement_start_month_from_start,
+        retirement_safe_withdrawal_rate_annual,
+        retirement_expense_reduction_fraction,
+        retirement_dynamic_safe_withdrawal_rate,
+    ) = _retirement_kernel_args(portfolio_config)
+    (
+        reinvest_enabled,
+        reinvest_crash_drawdown_threshold,
+        reinvest_recovery_fraction_of_peak,
+        reinvest_fraction_of_initial_sale_proceeds,
+        reinvest_cash_buffer_months,
+    ) = _reinvestment_kernel_args(portfolio_config)
 
     if sample_positions is None:
         sample_positions_arr = None
@@ -149,6 +214,16 @@ def simulate_fraction_tile_aggregates(
                 float(portfolio_config["ltcg_tax_rate"]),
                 float(portfolio_config["monthly_expenses"]),
                 float(portfolio_config["monthly_savings"]),
+                retirement_enabled,
+                retirement_start_month_from_start,
+                retirement_safe_withdrawal_rate_annual,
+                retirement_expense_reduction_fraction,
+                retirement_dynamic_safe_withdrawal_rate,
+                reinvest_enabled,
+                reinvest_crash_drawdown_threshold,
+                reinvest_recovery_fraction_of_peak,
+                reinvest_fraction_of_initial_sale_proceeds,
+                reinvest_cash_buffer_months,
                 float(market_config["cash_yield_annual"]),
                 float(log_utility_wealth_floor),
                 sample_positions_arr,
@@ -204,6 +279,20 @@ def simulate_fraction_tile_aggregates_synthetic(
     ext = load_cuda_extension()
     if not hasattr(ext, "simulate_fraction_tile_aggregates_synthetic"):
         raise GpuBackendError("CUDA extension does not expose simulate_fraction_tile_aggregates_synthetic.")
+    (
+        retirement_enabled,
+        retirement_start_month_from_start,
+        retirement_safe_withdrawal_rate_annual,
+        retirement_expense_reduction_fraction,
+        retirement_dynamic_safe_withdrawal_rate,
+    ) = _retirement_kernel_args(portfolio_config)
+    (
+        reinvest_enabled,
+        reinvest_crash_drawdown_threshold,
+        reinvest_recovery_fraction_of_peak,
+        reinvest_fraction_of_initial_sale_proceeds,
+        reinvest_cash_buffer_months,
+    ) = _reinvestment_kernel_args(portfolio_config)
 
     fractions = np.ascontiguousarray(fractions, dtype=np.float64)
     if sample_positions is None:
@@ -228,6 +317,16 @@ def simulate_fraction_tile_aggregates_synthetic(
             float(portfolio_config["ltcg_tax_rate"]),
             float(portfolio_config["monthly_expenses"]),
             float(portfolio_config["monthly_savings"]),
+            retirement_enabled,
+            retirement_start_month_from_start,
+            retirement_safe_withdrawal_rate_annual,
+            retirement_expense_reduction_fraction,
+            retirement_dynamic_safe_withdrawal_rate,
+            reinvest_enabled,
+            reinvest_crash_drawdown_threshold,
+            reinvest_recovery_fraction_of_peak,
+            reinvest_fraction_of_initial_sale_proceeds,
+            reinvest_cash_buffer_months,
             float(market_config["cash_yield_annual"]),
             float(log_utility_wealth_floor),
             synthetic_params,
@@ -259,6 +358,20 @@ def simulate_fraction_tile_synthetic(
     ext = load_cuda_extension()
     if not hasattr(ext, "simulate_fraction_tile_synthetic"):
         raise GpuBackendError("CUDA extension does not expose simulate_fraction_tile_synthetic.")
+    (
+        retirement_enabled,
+        retirement_start_month_from_start,
+        retirement_safe_withdrawal_rate_annual,
+        retirement_expense_reduction_fraction,
+        retirement_dynamic_safe_withdrawal_rate,
+    ) = _retirement_kernel_args(portfolio_config)
+    (
+        reinvest_enabled,
+        reinvest_crash_drawdown_threshold,
+        reinvest_recovery_fraction_of_peak,
+        reinvest_fraction_of_initial_sale_proceeds,
+        reinvest_cash_buffer_months,
+    ) = _reinvestment_kernel_args(portfolio_config)
 
     fractions = np.ascontiguousarray(fractions, dtype=np.float64)
     try:
@@ -270,6 +383,16 @@ def simulate_fraction_tile_synthetic(
             float(portfolio_config["ltcg_tax_rate"]),
             float(portfolio_config["monthly_expenses"]),
             float(portfolio_config["monthly_savings"]),
+            retirement_enabled,
+            retirement_start_month_from_start,
+            retirement_safe_withdrawal_rate_annual,
+            retirement_expense_reduction_fraction,
+            retirement_dynamic_safe_withdrawal_rate,
+            reinvest_enabled,
+            reinvest_crash_drawdown_threshold,
+            reinvest_recovery_fraction_of_peak,
+            reinvest_fraction_of_initial_sale_proceeds,
+            reinvest_cash_buffer_months,
             float(market_config["cash_yield_annual"]),
             synthetic_params,
             int(streams),

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,15 @@ import (
 )
 
 func main() {
+	configPath := flag.String("config", "", "Path to a JSON config file to preload in the TUI editor.")
+	flag.Parse()
+
+	startupConfigJSON, startupConfigSource, err := resolveStartupConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load startup config: %v\n", err)
+		os.Exit(1)
+	}
+
 	rootDir, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to determine working directory: %v\n", err)
@@ -44,10 +54,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	model := app.NewModel(svc, store)
-	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	model := app.NewModelWithOptions(svc, store, app.ModelOptions{
+		InitialConfigJSON: startupConfigJSON,
+		InitialConfigPath: startupConfigSource,
+	})
+	program := tea.NewProgram(
+		model,
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+		tea.WithReportFocus(),
+	)
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui exited with error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func resolveStartupConfig(configPath string) (string, string, error) {
+	if configPath == "" {
+		return "", "", nil
+	}
+
+	cfg, resolvedPath, err := app.LoadConfigFile(configPath)
+	if err != nil {
+		return "", "", err
+	}
+	text, err := app.FormatConfigJSON(cfg)
+	if err != nil {
+		return "", "", err
+	}
+	return text, resolvedPath, nil
 }
