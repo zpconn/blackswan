@@ -2491,6 +2491,14 @@ func formatApproxCount(value float64) string {
 			continue
 		}
 		scaled := value / unit.scale
+		if unit.label == "trillion" {
+			switch {
+			case scaled >= 100:
+				return fmt.Sprintf("%.1f %s", scaled, unit.label)
+			default:
+				return fmt.Sprintf("%.2f %s", scaled, unit.label)
+			}
+		}
 		switch {
 		case scaled >= 100:
 			return fmt.Sprintf("%.0f %s", scaled, unit.label)

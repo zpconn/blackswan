@@ -483,7 +483,8 @@ func TestFormatApproxCountUsesWordUnitsForLargeValues(t *testing.T) {
 	}{
 		{4_400_000, "4.4 million"},
 		{4_400_000_000, "4.4 billion"},
-		{14_500_000_000_000, "14.5 trillion"},
+		{14_500_000_000_000, "14.50 trillion"},
+		{123_450_000_000_000, "123.5 trillion"},
 	}
 	for _, tc := range cases {
 		got := formatApproxCount(tc.value)
