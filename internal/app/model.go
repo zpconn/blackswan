@@ -28,12 +28,37 @@ import (
 
 var (
 	chromeBG        = lipgloss.Color("#05090C")
-	panelBG         = lipgloss.Color("#0D141A")
 	panelBorder     = lipgloss.Color("#2D6A80")
 	accentPrimary   = lipgloss.Color("#50E3C2")
 	accentSecondary = lipgloss.Color("#F6AE2D")
 	mutedText       = lipgloss.Color("#8CA1AE")
 	warningText     = lipgloss.Color("#FF6B6B")
+	waveformLow     = lipgloss.Color("#2B4C5B")
+	waveformBandBG  = lipgloss.Color("#13232C")
+	cpuWavePalette  = []lipgloss.Color{
+		lipgloss.Color("#2B7EA1"),
+		lipgloss.Color("#20B6D9"),
+		lipgloss.Color("#44E7AE"),
+		lipgloss.Color("#D8F26F"),
+		lipgloss.Color("#F6AE2D"),
+		lipgloss.Color("#FF6B6B"),
+	}
+	gpuWavePalette = []lipgloss.Color{
+		lipgloss.Color("#1E7E9A"),
+		lipgloss.Color("#2DBBD3"),
+		lipgloss.Color("#6AE18A"),
+		lipgloss.Color("#C8EE63"),
+		lipgloss.Color("#F0C74B"),
+		lipgloss.Color("#FF8E53"),
+	}
+	memWavePalette = []lipgloss.Color{
+		lipgloss.Color("#287B8E"),
+		lipgloss.Color("#30BFA5"),
+		lipgloss.Color("#72DF7A"),
+		lipgloss.Color("#C6EB5A"),
+		lipgloss.Color("#EFB94D"),
+		lipgloss.Color("#FF8A65"),
+	}
 )
 
 var (
@@ -58,7 +83,6 @@ var (
 			Bold(true)
 
 	panelStyle = lipgloss.NewStyle().
-			Background(panelBG).
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(panelBorder).
 			Padding(0, 1)
@@ -76,7 +100,6 @@ var (
 
 	historySelectedLineStyle = lipgloss.NewStyle().
 					Foreground(accentPrimary).
-					Background(lipgloss.Color("#16323D")).
 					Bold(true)
 )
 
@@ -140,6 +163,10 @@ type pollTickMsg struct {
 	at time.Time
 }
 
+type waveTickMsg struct {
+	at time.Time
+}
+
 type systemMetricsSnapshot struct {
 	cpuTotalTicks uint64
 	cpuIdleTicks  uint64
@@ -170,7 +197,14 @@ const (
 
 const (
 	metricsPollInterval      = 1200 * time.Millisecond
+	waveAnimationInterval    = 120 * time.Millisecond
 	maxMetricsCatchupSamples = 12
+	fullMonitorBodyLines     = 11
+	fullMonitorPanelHeight   = fullMonitorBodyLines + 1
+	minMonitorPanelHeight    = 3
+	counterPanelHeight       = 3
+	minCounterPanelHeight    = 2
+	minTelemetryPanelHeight  = 2
 )
 
 type ModelOptions struct {
@@ -228,6 +262,13 @@ type Model struct {
 	telemetryEntries    []string
 	telemetryLines      []string
 	telemetryAutoFollow bool
+	monthUpdatesApprox  float64
+	estimateNSims       int64
+	estimateNFractions  int64
+	estimateHorizon     int64
+	passSimsCompleted   map[string]int64
+	passFractionCount   map[string]int64
+	cpuFractionsDone    int64
 
 	cpuUsagePct         float64
 	memUsagePct         float64
@@ -244,6 +285,7 @@ type Model struct {
 	cpuHistory          []float64
 	memHistory          []float64
 	gpuHistory          []float64
+	wavePhase           float64
 	terminalFocused     bool
 	lastMetricsSampleAt time.Time
 
@@ -251,6 +293,8 @@ type Model struct {
 	configPanelH int
 	resourceW    int
 	resourceH    int
+	counterW     int
+	counterH     int
 	telemetryW   int
 	telemetryH   int
 	resultsW     int
@@ -307,10 +351,14 @@ func NewModelWithOptions(svc *service.Manager, store *storage.Store, opts ModelO
 		gpuProbeEnabled:     true,
 		gpuNote:             "probing...",
 		telemetryAutoFollow: true,
+		passSimsCompleted:   map[string]int64{},
+		passFractionCount:   map[string]int64{},
 		configPanelW:        74,
 		configPanelH:        22,
 		resourceW:           54,
 		resourceH:           8,
+		counterW:            54,
+		counterH:            counterPanelHeight,
 		telemetryW:          54,
 		telemetryH:          22,
 		resultsW:            54,
@@ -338,6 +386,7 @@ func (m Model) Init() tea.Cmd {
 		loadHistoryCmd(m.store),
 		sampleSystemMetricsCmd(m.gpuProbeEnabled),
 		pollTickCmd(),
+		waveTickCmd(),
 	)
 }
 
@@ -761,6 +810,12 @@ func pollTickCmd() tea.Cmd {
 	})
 }
 
+func waveTickCmd() tea.Cmd {
+	return tea.Tick(waveAnimationInterval, func(at time.Time) tea.Msg {
+		return waveTickMsg{at: at}
+	})
+}
+
 func waitForStreamEventCmd(streamID int64, ch <-chan service.StreamEvent) tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-ch
@@ -932,6 +987,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
 
+	case waveTickMsg:
+		m.wavePhase = math.Mod(m.wavePhase+0.72, math.Pi*2048)
+		return m, waveTickCmd()
+
 	case pollTickMsg:
 		cmds := []tea.Cmd{pollTickCmd(), sampleSystemMetricsCmd(m.gpuProbeEnabled)}
 		if m.finalizingRun && m.pendingTerminal != nil {
@@ -1066,6 +1125,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.running = true
 		m.currentRunID = msg.runID
 		m.currentConfig = cloneMap(msg.config)
+		m.resetTelemetryEstimate(msg.config)
 		m.latestStatus = nil
 		m.lastPolledEventSeq = 0
 		m.events = m.events[:0]
@@ -1126,6 +1186,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		formatted := make([]string, 0, len(msg.events))
 		for _, event := range msg.events {
 			m.events = append(m.events, event)
+			m.updateTelemetryEstimateFromEvent(event)
 			if event.Seq > m.lastPolledEventSeq {
 				m.lastPolledEventSeq = event.Seq
 			}
@@ -1201,6 +1262,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.latestStatus = msg.status
 		m.results.SetContent(renderRunStatus(msg.status))
+
+		if strings.TrimSpace(msg.status.LatestEvent) != "" {
+			m.updateTelemetryEstimateFromEvent(service.StreamEvent{
+				Seq:     msg.status.LatestSeq,
+				Event:   msg.status.LatestEvent,
+				Payload: msg.status.LatestEventPayload,
+			})
+		}
 
 		if msg.status.LatestSeq > m.lastPolledEventSeq && strings.TrimSpace(msg.status.LatestEvent) != "" {
 			m.lastPolledEventSeq = msg.status.LatestSeq
@@ -1381,9 +1450,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+l":
 			m.telemetryEntries = nil
 			m.telemetryLines = nil
-			m.telemetry.SetContent("")
 			m.telemetryAutoFollow = true
 			m.events = nil
+			m.rebuildTelemetryContent(true)
 			m.statusText = "Telemetry cleared"
 			return m, nil
 		}
@@ -1463,24 +1532,37 @@ func (m Model) View() string {
 		m.configPanelH,
 		m.focusPane == paneConfig,
 	)
-	telemetryPanel := renderPanel(
-		"Live Telemetry",
-		m.telemetry.View(),
-		m.telemetryW,
-		m.telemetryH,
-		m.focusPane == paneTelemetry,
+	monitorPanel := renderPanel(
+		"System Monitor",
+		m.renderSystemMonitor(),
+		m.resourceW,
+		m.resourceH,
+		false,
 	)
-	rightColumn := telemetryPanel
-	if m.resourceH >= 5 {
+	counterPanel := renderPanel(
+		"Month-to-Month Steps (So Far)",
+		m.renderComputeCounter(),
+		m.counterW,
+		m.counterH,
+		false,
+	)
+	rightColumn := lipgloss.JoinVertical(
+		lipgloss.Left,
+		monitorPanel,
+		counterPanel,
+	)
+	if m.telemetryH >= minTelemetryPanelHeight {
+		telemetryPanel := renderPanel(
+			"Live Telemetry",
+			m.telemetry.View(),
+			m.telemetryW,
+			m.telemetryH,
+			m.focusPane == paneTelemetry,
+		)
 		rightColumn = lipgloss.JoinVertical(
 			lipgloss.Left,
-			renderPanel(
-				"System Monitor",
-				m.renderSystemMonitor(),
-				m.resourceW,
-				m.resourceH,
-				false,
-			),
+			monitorPanel,
+			counterPanel,
 			telemetryPanel,
 		)
 	}
@@ -1611,13 +1693,24 @@ func (m *Model) resizePanels() {
 	}
 
 	usableW := maxInt(40, m.width-6)
-	usableH := maxInt(14, m.height-10)
+	innerH := maxInt(12, m.height-2)
+	verticalOverhead := 5
+	if m.showHelp {
+		verticalOverhead = 7
+	}
+	panelRowsBudget := maxInt(10, innerH-verticalOverhead)
 
-	topH := int(math.Round(float64(usableH) * 0.58))
-	topH = clampInt(topH, 8, usableH-5)
-	bottomH := usableH - topH
-	if bottomH < 5 {
-		bottomH = 5
+	minBottomActual := 3
+	minTopActual := (minMonitorPanelHeight + 2) + (minCounterPanelHeight + 2) + (minTelemetryPanelHeight + 2)
+	if panelRowsBudget < minTopActual+minBottomActual {
+		minBottomActual = 2
+	}
+	topH := int(math.Round(float64(panelRowsBudget) * 0.75))
+	topH = clampInt(topH, minTopActual, maxInt(minTopActual, panelRowsBudget-minBottomActual))
+	bottomH := panelRowsBudget - topH
+	if bottomH < minBottomActual {
+		bottomH = minBottomActual
+		topH = maxInt(minTopActual, panelRowsBudget-bottomH)
 	}
 
 	leftW := int(math.Round(float64(usableW) * 0.54))
@@ -1629,55 +1722,70 @@ func (m *Model) resizePanels() {
 	historyW := usableW - resultsW
 
 	configInnerW := maxInt(20, leftW-6)
-	configInnerH := maxInt(5, topH-4)
-	configEditorH := maxInt(3, configInnerH-1)
+	configInnerH := maxInt(2, topH-3)
+	configEditorH := maxInt(1, configInnerH)
 	m.configEditor.SetWidth(configInnerW)
 	m.configEditor.SetHeight(configEditorH)
 	m.configPanelW = configInnerW + 4
-	m.configPanelH = configEditorH + 3
+	m.configPanelH = configEditorH + 1
 
 	telemetryInnerW := maxInt(18, rightW-6)
-	rightTotalH := maxInt(6, m.configPanelH)
-	resourcePanelH := 0
-	telemetryPanelH := rightTotalH
-	if rightTotalH >= 12 {
-		resourcePanelH = clampInt(int(math.Round(float64(rightTotalH)*0.38)), 5, rightTotalH-5)
-		telemetryPanelH = rightTotalH - resourcePanelH
+	rightTotalActual := topH
+	monitorActual := minMonitorPanelHeight + 2
+	counterActual := minCounterPanelHeight + 2
+	telemetryActual := minTelemetryPanelHeight + 2
+	extraActual := maxInt(0, rightTotalActual-monitorActual-counterActual-telemetryActual)
+
+	consumeExtra := func(value *int, target int) {
+		if extraActual <= 0 {
+			return
+		}
+		if target <= *value {
+			return
+		}
+		step := minInt(extraActual, target-*value)
+		*value += step
+		extraActual -= step
 	}
 
-	resourceViewH := 0
-	if resourcePanelH > 0 {
-		resourceViewH = maxInt(2, resourcePanelH-3)
-	}
-	telemetryViewH := maxInt(2, telemetryPanelH-3)
+	consumeExtra(&monitorActual, 8)
+	consumeExtra(&telemetryActual, 8)
+	consumeExtra(&counterActual, counterPanelHeight+2)
+	consumeExtra(&monitorActual, fullMonitorPanelHeight+2)
+	consumeExtra(&telemetryActual, 11)
+	monitorActual += extraActual
+
+	resourcePanelH := maxInt(minMonitorPanelHeight, monitorActual-2)
+	counterH := maxInt(minCounterPanelHeight, counterActual-2)
+	telemetryPanelH := maxInt(minTelemetryPanelHeight, telemetryActual-2)
+
+	telemetryViewH := maxInt(1, telemetryPanelH-1)
 
 	m.resourceW = telemetryInnerW + 4
-	if resourcePanelH > 0 {
-		m.resourceH = resourceViewH + 3
-	} else {
-		m.resourceH = 0
-	}
+	m.resourceH = resourcePanelH
+	m.counterW = telemetryInnerW + 4
+	m.counterH = counterH
 
 	m.telemetry.Width = telemetryInnerW
 	m.telemetry.Height = telemetryViewH
 	m.telemetryW = telemetryInnerW + 4
-	m.telemetryH = telemetryViewH + 3
+	m.telemetryH = telemetryPanelH
 
 	resultsInnerW := maxInt(22, resultsW-6)
-	resultsInnerH := maxInt(4, bottomH-4)
-	resultsViewH := maxInt(3, resultsInnerH-1)
+	resultsInnerH := maxInt(1, bottomH-2)
+	resultsViewH := maxInt(1, resultsInnerH-1)
 	m.results.Width = resultsInnerW
 	m.results.Height = resultsViewH
 	m.resultsW = resultsInnerW + 4
-	m.resultsH = resultsViewH + 3
+	m.resultsH = resultsViewH + 1
 
 	historyInnerW := maxInt(16, historyW-6)
-	historyInnerH := maxInt(4, bottomH-4)
-	historyViewH := maxInt(3, historyInnerH-1)
+	historyInnerH := maxInt(1, bottomH-2)
+	historyViewH := maxInt(1, historyInnerH-1)
 	m.history.Width = historyInnerW
 	m.history.Height = historyViewH
 	m.historyW = historyInnerW + 4
-	m.historyH = historyViewH + 3
+	m.historyH = historyViewH + 1
 	m.configPathInput.Width = clampInt(usableW-22, 20, 78)
 
 	if len(m.telemetryEntries) > 0 {
@@ -1876,7 +1984,7 @@ func (m Model) renderSystemMonitor() string {
 	innerW := maxInt(18, m.resourceW-6)
 	meterW := clampInt(innerW-16, 8, 24)
 	trendW := maxInt(10, innerW-6)
-	maxBodyLines := maxInt(2, m.resourceH-3)
+	maxBodyLines := maxInt(2, m.resourceH-1)
 
 	cpuLine := fmt.Sprintf("CPU  %5.1f%% %s", m.cpuUsagePct, renderUsageMeter(m.cpuUsagePct, meterW))
 	memLine := "MEM  n/a"
@@ -1890,20 +1998,47 @@ func (m Model) renderSystemMonitor() string {
 		gpuLine = truncateText("GPU  n/a ("+m.gpuNote+")", innerW)
 	}
 
-	summary := []string{cpuLine, memLine, gpuLine}
-	if maxBodyLines <= len(summary) {
+	if maxBodyLines <= 3 {
+		summary := []string{cpuLine, memLine, gpuLine}
 		return strings.Join(summary[:maxBodyLines], "\n")
 	}
 
-	lines := append([]string{}, summary...)
-	lines = append(lines, "cpu~ "+renderUsageTrend(m.cpuHistory, trendW))
-	if m.gpuAvailable {
-		lines = append(lines, "gpu~ "+renderUsageTrend(m.gpuHistory, trendW))
-	} else if strings.TrimSpace(m.gpuNote) != "" {
-		lines = append(lines, truncateText("gpu~ unavailable: "+m.gpuNote, innerW))
-	}
-	if m.memAvailable {
-		lines = append(lines, "mem~ "+renderUsageTrend(m.memHistory, trendW))
+	compactWaveLayout := maxBodyLines < 9
+	lines := []string{cpuLine, gpuLine}
+	if compactWaveLayout {
+		lines = append(lines, "cpu~ "+renderUsageWaveform(m.cpuHistory, trendW, m.wavePhase, cpuWavePalette))
+		if m.gpuAvailable {
+			lines = append(lines, "gpu~ "+renderUsageWaveform(m.gpuHistory, trendW, m.wavePhase+1.3, gpuWavePalette))
+		} else if strings.TrimSpace(m.gpuNote) != "" {
+			lines = append(lines, truncateText("gpu~ unavailable: "+m.gpuNote, innerW))
+		}
+		lines = append(lines, memLine)
+		if m.memAvailable {
+			lines = append(lines, "mem~ "+renderUsageWaveform(m.memHistory, trendW, m.wavePhase+2.1, memWavePalette))
+		}
+	} else {
+		cpuTop, cpuBottom := renderUsageWaveformRows(m.cpuHistory, trendW, m.wavePhase, cpuWavePalette)
+		lines = append(lines,
+			"cpu~ "+cpuTop,
+			waveformContinuationPrefix+cpuBottom,
+		)
+		if m.gpuAvailable {
+			gpuTop, gpuBottom := renderUsageWaveformRows(m.gpuHistory, trendW, m.wavePhase+1.3, gpuWavePalette)
+			lines = append(lines,
+				"gpu~ "+gpuTop,
+				waveformContinuationPrefix+gpuBottom,
+			)
+		} else if strings.TrimSpace(m.gpuNote) != "" {
+			lines = append(lines, truncateText("gpu~ unavailable: "+m.gpuNote, innerW))
+		}
+		lines = append(lines, memLine)
+		if m.memAvailable {
+			memTop, memBottom := renderUsageWaveformRows(m.memHistory, trendW, m.wavePhase+2.1, memWavePalette)
+			lines = append(lines,
+				"mem~ "+memTop,
+				waveformContinuationPrefix+memBottom,
+			)
+		}
 	}
 	if m.gpuAvailable {
 		lines = append(lines, fmt.Sprintf("VRAM %5.1f%% %s", m.gpuMemUsagePct, renderUsageMeter(m.gpuMemUsagePct, meterW)))
@@ -1925,16 +2060,34 @@ func renderUsageMeter(percent float64, width int) string {
 	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
 }
 
-func renderUsageTrend(samples []float64, width int) string {
-	width = maxInt(4, width)
-	if len(samples) == 0 {
-		return strings.Repeat(".", width)
-	}
+const (
+	waveformPadRune            = '▁'
+	waveformGlyphsRaw          = "▁▂▃▄▅▆▇█"
+	waveformTopPad             = ' '
+	waveformContinuationPrefix = "     "
+)
 
-	levels := []rune("._-:=+*#%@")
-	out := make([]rune, width)
-	for idx := range out {
-		out[idx] = '.'
+func renderUsageWaveform(samples []float64, width int, phase float64, palette []lipgloss.Color) string {
+	_, bottom := renderUsageWaveformRows(samples, width, phase, palette)
+	return bottom
+}
+
+func renderUsageWaveformRows(samples []float64, width int, phase float64, palette []lipgloss.Color) (string, string) {
+	width = maxInt(4, width)
+	styles := waveformStyles(palette)
+	waveGlyphs := []rune(waveformGlyphsRaw)
+	baseTopStyle := lipgloss.NewStyle().Background(waveformBandBG)
+	baseBottomStyle := lipgloss.NewStyle().
+		Foreground(waveformLow).
+		Background(waveformBandBG)
+	top := make([]string, width)
+	bottom := make([]string, width)
+	for idx := 0; idx < width; idx++ {
+		top[idx] = baseTopStyle.Render(string(waveformTopPad))
+		bottom[idx] = baseBottomStyle.Render(string(waveformPadRune))
+	}
+	if len(samples) == 0 {
+		return strings.Join(top, ""), strings.Join(bottom, "")
 	}
 
 	window := samples
@@ -1943,13 +2096,56 @@ func renderUsageTrend(samples []float64, width int) string {
 	}
 	start := width - len(window)
 	for idx := 0; idx < len(window); idx++ {
-		source := window[idx]
-		p := clampFloat(source, 0, 100)
-		levelIdx := int(math.Round((p / 100.0) * float64(len(levels)-1)))
-		levelIdx = clampInt(levelIdx, 0, len(levels)-1)
-		out[start+idx] = levels[levelIdx]
+		signal := clampFloat(window[idx], 0, 100) / 100.0
+
+		primary := math.Sin(float64(idx)*0.92 + phase*1.85)
+		harmonic := 0.36 * math.Sin(float64(idx)*2.18+phase*3.2)
+		wobble := (primary + harmonic) / 1.36
+
+		amplitude := 0.16 + (signal * 0.62)
+		baseline := 0.15 + (signal * 0.62)
+		levelValue := clampFloat(baseline+wobble*amplitude, 0, 1)
+
+		baseLevel := int(math.Round(levelValue * float64(len(waveGlyphs)-1)))
+		baseLevel = clampInt(baseLevel, 0, len(waveGlyphs)-1)
+		heightBoost := 0
+		if signal > 0.62 {
+			heightBoost = int(math.Round(((signal - 0.62) / 0.38) * float64(len(waveGlyphs)-1)))
+		}
+		heightBoost = clampInt(heightBoost, 0, len(waveGlyphs)-1)
+		totalLevel := clampInt(baseLevel+heightBoost, 0, (len(waveGlyphs)*2)-1)
+
+		lowerLevel := totalLevel
+		upperLevel := 0
+		if totalLevel > len(waveGlyphs)-1 {
+			lowerLevel = len(waveGlyphs) - 1
+			upperLevel = totalLevel - (len(waveGlyphs) - 1)
+		}
+
+		energy := clampFloat((signal*0.5)+(float64(totalLevel)/float64((len(waveGlyphs)*2)-1))*0.5, 0, 1)
+		colorIdx := int(math.Round(energy * float64(len(styles)-1)))
+		colorIdx = clampInt(colorIdx, 0, len(styles)-1)
+		style := styles[colorIdx]
+
+		bottom[start+idx] = style.Render(string(waveGlyphs[clampInt(lowerLevel, 0, len(waveGlyphs)-1)]))
+		if upperLevel > 0 {
+			top[start+idx] = style.Render(string(waveGlyphs[clampInt(upperLevel-1, 0, len(waveGlyphs)-1)]))
+		}
 	}
-	return string(out)
+	return strings.Join(top, ""), strings.Join(bottom, "")
+}
+
+func waveformStyles(palette []lipgloss.Color) []lipgloss.Style {
+	if len(palette) == 0 {
+		palette = cpuWavePalette
+	}
+	styles := make([]lipgloss.Style, len(palette))
+	for idx, color := range palette {
+		styles[idx] = lipgloss.NewStyle().
+			Foreground(color).
+			Background(waveformBandBG)
+	}
+	return styles
 }
 
 func appendUsageSample(history []float64, value float64, maxLen int) []float64 {
@@ -2103,6 +2299,220 @@ func (m *Model) rebuildTelemetryContent(shouldFollow bool) {
 		m.telemetry.GotoBottom()
 		m.telemetryAutoFollow = true
 	}
+}
+
+func (m Model) renderComputeCounter() string {
+	if m.monthUpdatesApprox <= 0 {
+		if m.running || m.finalizingRun {
+			return "0 (warming up...)"
+		}
+		return "0"
+	}
+	value := formatApproxCount(m.monthUpdatesApprox)
+	if m.running || m.finalizingRun {
+		return value + " | live"
+	}
+	return value
+}
+
+func (m *Model) resetTelemetryEstimate(config map[string]any) {
+	m.monthUpdatesApprox = 0
+	m.cpuFractionsDone = 0
+	m.passSimsCompleted = map[string]int64{}
+	m.passFractionCount = map[string]int64{}
+	m.estimateNSims = estimateConfigInt(config, "simulation", "n_sims")
+	m.estimateNFractions = estimateConfigInt(config, "decision_grid", "num_points")
+	m.estimateHorizon = estimateHorizonMonths(config)
+	if m.estimateNFractions > 0 {
+		m.passFractionCount["primary_pass"] = m.estimateNFractions
+	}
+}
+
+func (m *Model) updateTelemetryEstimateFromEvent(event service.StreamEvent) {
+	name := strings.TrimSpace(event.Event)
+	if name == "" {
+		return
+	}
+	payload := event.Payload
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	hasExactCounter := false
+	if computed, ok := asNonNegativeInt64(payload["month_updates_computed"]); ok {
+		if float64(computed) > m.monthUpdatesApprox {
+			m.monthUpdatesApprox = float64(computed)
+		}
+		hasExactCounter = true
+	}
+
+	switch {
+	case name == "run_start":
+		if nSims, ok := asNonNegativeInt64(payload["n_sims"]); ok && nSims > 0 {
+			m.estimateNSims = nSims
+		}
+		if nFractions, ok := asNonNegativeInt64(payload["n_fractions"]); ok && nFractions > 0 {
+			m.estimateNFractions = nFractions
+			m.passFractionCount["primary_pass"] = nFractions
+		}
+		return
+	case strings.HasSuffix(name, "_start"):
+		phase := strings.TrimSuffix(name, "_start")
+		if nSims, ok := asNonNegativeInt64(payload["n_sims"]); ok && nSims > 0 {
+			m.estimateNSims = nSims
+		}
+		if phaseFractions, ok := asNonNegativeInt64(payload["fraction_count"]); ok && phaseFractions > 0 {
+			m.passFractionCount[phase] = phaseFractions
+			return
+		}
+		if phaseFractions, ok := asNonNegativeInt64(payload["n_fractions"]); ok && phaseFractions > 0 {
+			m.passFractionCount[phase] = phaseFractions
+		}
+		return
+	}
+	if hasExactCounter && strings.HasSuffix(name, "_progress") {
+		return
+	}
+
+	if name == "cpu_fraction_eval_progress" {
+		completed, ok := asNonNegativeInt64(payload["completed"])
+		if !ok {
+			return
+		}
+		delta := completed - m.cpuFractionsDone
+		if delta <= 0 {
+			return
+		}
+		m.cpuFractionsDone = completed
+		nSims := m.estimateNSims
+		if nSims <= 0 {
+			nSims = 1
+		}
+		horizon := m.estimateHorizon
+		if horizon <= 0 {
+			horizon = 1
+		}
+		m.monthUpdatesApprox += float64(delta) * float64(nSims) * float64(horizon)
+		return
+	}
+
+	if !strings.HasSuffix(name, "_progress") {
+		return
+	}
+	phase := strings.TrimSuffix(name, "_progress")
+	simsCompleted, ok := asNonNegativeInt64(payload["sims_completed"])
+	if !ok {
+		return
+	}
+	prev := m.passSimsCompleted[phase]
+	if simsCompleted <= prev {
+		return
+	}
+	m.passSimsCompleted[phase] = simsCompleted
+	deltaSims := simsCompleted - prev
+	if simsTotal, ok := asNonNegativeInt64(payload["sims_total"]); ok && simsTotal > 0 && m.estimateNSims <= 0 {
+		m.estimateNSims = simsTotal
+	}
+	fractions := m.passFractionCount[phase]
+	if fractions <= 0 {
+		fractions = m.estimateNFractions
+	}
+	if fractions <= 0 {
+		fractions = 1
+	}
+	horizon := m.estimateHorizon
+	if horizon <= 0 {
+		horizon = 1
+	}
+	m.monthUpdatesApprox += float64(deltaSims) * float64(fractions) * float64(horizon)
+}
+
+func estimateConfigInt(config map[string]any, path ...string) int64 {
+	value, ok := nestedConfigValue(config, path...)
+	if !ok {
+		return 0
+	}
+	out, ok := asNonNegativeInt64(value)
+	if !ok {
+		return 0
+	}
+	return out
+}
+
+func estimateHorizonMonths(config map[string]any) int64 {
+	if horizon := estimateConfigInt(config, "simulation", "horizon_months"); horizon > 0 {
+		return horizon
+	}
+	if minHorizon := estimateConfigInt(config, "simulation", "min_horizon_months"); minHorizon > 0 {
+		return minHorizon
+	}
+	return 72
+}
+
+func nestedConfigValue(config map[string]any, path ...string) (any, bool) {
+	if len(path) == 0 || config == nil {
+		return nil, false
+	}
+	var current any = config
+	for _, key := range path {
+		node, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		next, ok := node[key]
+		if !ok {
+			return nil, false
+		}
+		current = next
+	}
+	return current, true
+}
+
+func asNonNegativeInt64(value any) (int64, bool) {
+	number, ok := asFloat(value)
+	if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
+		return 0, false
+	}
+	return int64(math.Round(number)), true
+}
+
+func formatApproxCount(value float64) string {
+	value = clampFloat(value, 0, math.MaxFloat64)
+
+	wordUnits := []struct {
+		scale float64
+		label string
+	}{
+		{1_000_000_000_000.0, "trillion"},
+		{1_000_000_000.0, "billion"},
+		{1_000_000.0, "million"},
+	}
+	for _, unit := range wordUnits {
+		if value < unit.scale {
+			continue
+		}
+		scaled := value / unit.scale
+		switch {
+		case scaled >= 100:
+			return fmt.Sprintf("%.0f %s", scaled, unit.label)
+		default:
+			return fmt.Sprintf("%.1f %s", scaled, unit.label)
+		}
+	}
+
+	// Keep compact "K" notation for thousands to preserve dense display in small panes.
+	if value >= 1000.0 {
+		scaled := value / 1000.0
+		switch {
+		case scaled >= 100:
+			return fmt.Sprintf("%.0fK", scaled)
+		case scaled >= 10:
+			return fmt.Sprintf("%.1fK", scaled)
+		default:
+			return fmt.Sprintf("%.2fK", scaled)
+		}
+	}
+
+	return fmt.Sprintf("%.0f", value)
 }
 
 func normalizeTelemetryEntry(raw string) string {

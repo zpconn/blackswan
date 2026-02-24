@@ -121,6 +121,23 @@ def _emit_progress(progress_callback, event, **payload):
         pass
 
 
+def _add_month_updates(progress_state, delta):
+    if progress_state is None:
+        return
+    if delta is None:
+        return
+    delta_int = int(delta)
+    if delta_int <= 0:
+        return
+    progress_state["month_updates_computed"] = int(progress_state.get("month_updates_computed", 0)) + delta_int
+
+
+def _emit_progress_with_state(progress_callback, progress_state, event, **payload):
+    if progress_state is not None and "month_updates_computed" not in payload:
+        payload["month_updates_computed"] = int(progress_state.get("month_updates_computed", 0))
+    _emit_progress(progress_callback, event, **payload)
+
+
 def _deep_merge(base, overrides):
     merged = deepcopy(base)
     _deep_merge_in_place(merged, overrides)
@@ -1579,6 +1596,7 @@ def _run_streaming_primary_pass(
     use_cuda_backend,
     sample_indices,
     progress_callback=None,
+    progress_state=None,
 ):
     simulation = config["simulation"]
     risk = config["risk"]
@@ -1613,13 +1631,15 @@ def _run_streaming_primary_pass(
     rng = np.random.default_rng(simulation["seed"]) if not use_device_generation else None
     sample_ptr = 0
     total_chunks = max(1, int(np.ceil(n_sims / chunk_size)))
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         "primary_pass_start",
         backend=("cuda" if use_cuda_backend else "numpy_streaming"),
         device_generation=bool(use_device_generation),
         n_sims=int(n_sims),
         n_fractions=int(n_fractions),
+        horizon_months=int(horizon_months),
         chunk_size=int(chunk_size),
         fraction_tile_size=int(fraction_tile_size),
         total_chunks=int(total_chunks),
@@ -1680,9 +1700,11 @@ def _run_streaming_primary_pass(
             summary_acc["non_crash_count"] += chunk_summary["non_crash_count"]
             summary_acc["layoff_non_crash_count"] += chunk_summary["layoff_non_crash_count"]
 
+            _add_month_updates(progress_state, int(chunk_n) * int(n_fractions) * int(horizon_months))
             chunk_idx += 1
-            _emit_progress(
+            _emit_progress_with_state(
                 progress_callback,
+                progress_state,
                 "primary_pass_progress",
                 chunk_index=int(chunk_idx),
                 total_chunks=int(total_chunks),
@@ -1754,9 +1776,11 @@ def _run_streaming_primary_pass(
                     ]
                     transfer_time_ms += (time.perf_counter() - t_transfer) * 1000.0
 
+        _add_month_updates(progress_state, int(chunk_n) * int(n_fractions) * int(horizon_months))
         chunk_idx += 1
-        _emit_progress(
+        _emit_progress_with_state(
             progress_callback,
+            progress_state,
             "primary_pass_progress",
             chunk_index=int(chunk_idx),
             total_chunks=int(total_chunks),
@@ -1768,8 +1792,9 @@ def _run_streaming_primary_pass(
 
     total_ms = (time.perf_counter() - t0) * 1000.0
     reduction_time_ms = max(0.0, total_ms - kernel_time_ms - transfer_time_ms)
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         "primary_pass_complete",
         kernel_time_ms=float(kernel_time_ms),
         transfer_time_ms=float(transfer_time_ms),
@@ -1870,6 +1895,7 @@ def _compute_exact_tail_metrics_via_memmap(
     use_cuda_backend,
     progress_callback=None,
     progress_phase="exact_tail_pass",
+    progress_state=None,
 ):
     if not fraction_indices:
         return {}
@@ -1890,11 +1916,13 @@ def _compute_exact_tail_metrics_via_memmap(
     temp_dir = gpu["exact_temp_dir"] or tempfile.gettempdir()
     total_chunks = max(1, int(np.ceil(n_sims / chunk_size)))
 
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         f"{progress_phase}_start",
         n_sims=int(n_sims),
         fraction_count=int(subset_n),
+        horizon_months=int(horizon_months),
         chunk_size=int(chunk_size),
         fraction_tile_size=int(tile_size),
         total_chunks=int(total_chunks),
@@ -1941,9 +1969,11 @@ def _compute_exact_tail_metrics_via_memmap(
                     )
                 values[tile_start:tile_end, write_pos : write_pos + chunk_n] = tile_final
             write_pos += chunk_n
+            _add_month_updates(progress_state, int(chunk_n) * int(subset_n) * int(horizon_months))
             chunk_idx += 1
-            _emit_progress(
+            _emit_progress_with_state(
                 progress_callback,
+                progress_state,
                 f"{progress_phase}_progress",
                 chunk_index=int(chunk_idx),
                 total_chunks=int(total_chunks),
@@ -1980,8 +2010,9 @@ def _compute_exact_tail_metrics_via_memmap(
         except OSError:
             pass
 
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         f"{progress_phase}_complete",
         fraction_count=int(subset_n),
         reduction_workers=int(reduction_workers),
@@ -2015,7 +2046,12 @@ def _select_refine_candidate_indices(diagnostics, max_ruin_probability, refine_t
     return merged
 
 
-def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_callback=None):
+def _collect_fraction_metrics_streaming(
+    fractions_to_test,
+    config,
+    progress_callback=None,
+    progress_state=None,
+):
     simulation = config["simulation"]
     gpu = config["gpu"]
     n_sims = simulation["n_sims"]
@@ -2044,13 +2080,15 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
     if tune_note is not None:
         fallback_reasons.append(tune_note)
 
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         "streaming_setup",
         backend=("cuda" if use_cuda_backend else "numpy_streaming"),
         cvar_mode=gpu["cvar_mode"],
         n_sims=int(n_sims),
         n_fractions=int(n_fractions),
+        horizon_months=int(horizon_months),
         chunk_size=int(chunk_size),
         fraction_tile_size=int(fraction_tile_size),
         gpu_name=gpu_meta["gpu_name"],
@@ -2073,8 +2111,9 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
                     sample_size,
                     simulation["seed"] + 10_003,
                 )
-                _emit_progress(
+                _emit_progress_with_state(
                     progress_callback,
+                    progress_state,
                     "tail_sampling_setup",
                     cvar_mode=gpu["cvar_mode"],
                     sample_size=int(sample_size),
@@ -2089,6 +2128,7 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
                 use_cuda_backend,
                 sample_indices,
                 progress_callback=progress_callback,
+                progress_state=progress_state,
             )
             kernel_time_ms = primary["kernel_time_ms"]
             transfer_time_ms = primary["transfer_time_ms"]
@@ -2101,9 +2141,19 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
 
             sample_matrix = primary["sample_matrix"]
             if gpu["cvar_mode"] == "streaming_near_exact":
-                _emit_progress(progress_callback, "tail_reduce_start", mode="streaming_near_exact")
+                _emit_progress_with_state(
+                    progress_callback,
+                    progress_state,
+                    "tail_reduce_start",
+                    mode="streaming_near_exact",
+                )
                 p10, cvar = _derive_tail_metrics_from_samples(config, sample_matrix)
-                _emit_progress(progress_callback, "tail_reduce_complete", mode="streaming_near_exact")
+                _emit_progress_with_state(
+                    progress_callback,
+                    progress_state,
+                    "tail_reduce_complete",
+                    mode="streaming_near_exact",
+                )
             else:
                 p10 = np.zeros(n_fractions, dtype=np.float64)
                 cvar = np.zeros(n_fractions, dtype=np.float64)
@@ -2129,8 +2179,9 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
             if gpu["cvar_mode"] == "exact_two_pass":
                 can_run_exact, exact_reason = _can_run_exact_tail_pass(config, n_fractions, n_sims)
                 if not can_run_exact:
-                    _emit_progress(
+                    _emit_progress_with_state(
                         progress_callback,
+                        progress_state,
                         "exact_pass_skipped",
                         reason=exact_reason,
                     )
@@ -2150,6 +2201,7 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
                         use_cuda_backend,
                         progress_callback=progress_callback,
                         progress_phase="exact_pass",
+                        progress_state=progress_state,
                     )
                 except (MemoryError, OSError) as exc:
                     raise RuntimeError(
@@ -2164,8 +2216,9 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
                     gpu["refine_top_k"],
                 )
                 if refine_indices:
-                    _emit_progress(
+                    _emit_progress_with_state(
                         progress_callback,
+                        progress_state,
                         "refine_pass_start",
                         candidate_count=int(len(refine_indices)),
                     )
@@ -2186,6 +2239,7 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
                                 use_cuda_backend,
                                 progress_callback=progress_callback,
                                 progress_phase="refine_pass",
+                                progress_state=progress_state,
                             )
                             _apply_exact_tail_metrics(diagnostics, exact_map, config)
                         except (MemoryError, OSError) as exc:
@@ -2195,7 +2249,12 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
                             )
                     elif refine_reason is not None:
                         fallback_reasons.append(refine_reason)
-                        _emit_progress(progress_callback, "refine_pass_skipped", reason=refine_reason)
+                        _emit_progress_with_state(
+                            progress_callback,
+                            progress_state,
+                            "refine_pass_skipped",
+                            reason=refine_reason,
+                        )
             reduction_time_ms += (time.perf_counter() - exact_start) * 1000.0
             break
         except Exception as exc:
@@ -2215,8 +2274,9 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
                 "CUDA OOM encountered; backoff applied to "
                 f"chunk={chunk_size}, tile={fraction_tile_size}."
             )
-            _emit_progress(
+            _emit_progress_with_state(
                 progress_callback,
+                progress_state,
                 "oom_backoff",
                 previous_chunk_size=int(prev_chunk),
                 previous_fraction_tile_size=int(prev_tile),
@@ -2245,8 +2305,9 @@ def _collect_fraction_metrics_streaming(fractions_to_test, config, progress_call
         "transfer_time_ms": float(transfer_time_ms),
         "reduction_time_ms": float(reduction_time_ms),
     }
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         "streaming_complete",
         backend=execution["backend"],
         kernel_time_ms=execution["kernel_time_ms"],
@@ -2337,42 +2398,73 @@ def _resolve_execution_settings(config, task_count):
     return execution
 
 
-def _collect_fraction_metrics_single_thread(fractions_to_test, universe, config, progress_callback=None):
+def _collect_fraction_metrics_single_thread(
+    fractions_to_test,
+    universe,
+    config,
+    progress_callback=None,
+    progress_state=None,
+):
     diagnostics = []
     total = len(fractions_to_test)
+    n_sims = int(universe["n_sims"])
+    horizon_months = int(universe["horizon_months"])
     emit_every = max(1, total // 200)
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         "cpu_fraction_eval_start",
         mode="single",
+        n_sims=int(n_sims),
+        horizon_months=int(horizon_months),
         total_fractions=int(total),
     )
     for idx, fraction in enumerate(fractions_to_test):
         _, metrics = _evaluate_fraction_direct(idx, fraction, universe, config)
         diagnostics.append(metrics)
+        _add_month_updates(progress_state, n_sims * horizon_months)
         if ((idx + 1) % emit_every == 0) or idx == total - 1:
-            _emit_progress(
+            _emit_progress_with_state(
                 progress_callback,
+                progress_state,
                 "cpu_fraction_eval_progress",
                 mode="single",
                 completed=int(idx + 1),
                 total=int(total),
                 percent_complete=float((idx + 1) / total),
             )
-    _emit_progress(progress_callback, "cpu_fraction_eval_complete", mode="single", total_fractions=int(total))
+    _emit_progress_with_state(
+        progress_callback,
+        progress_state,
+        "cpu_fraction_eval_complete",
+        mode="single",
+        total_fractions=int(total),
+    )
     return diagnostics
 
 
-def _collect_fraction_metrics_parallel(fractions_to_test, universe, config, execution, progress_callback=None):
+def _collect_fraction_metrics_parallel(
+    fractions_to_test,
+    universe,
+    config,
+    execution,
+    progress_callback=None,
+    progress_state=None,
+):
     tasks = [(idx, float(fraction)) for idx, fraction in enumerate(fractions_to_test)]
     futures = {}
     results = {}
     mp_context = multiprocessing.get_context(execution["start_method"])
+    n_sims = int(universe["n_sims"])
+    horizon_months = int(universe["horizon_months"])
 
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         "cpu_fraction_eval_start",
         mode="parallel",
+        n_sims=int(n_sims),
+        horizon_months=int(horizon_months),
         total_fractions=int(len(tasks)),
         workers=int(execution["workers_used"]),
     )
@@ -2393,8 +2485,10 @@ def _collect_fraction_metrics_parallel(fractions_to_test, universe, config, exec
             idx, metrics = future.result()
             results[idx] = metrics
             completed += 1
-            _emit_progress(
+            _add_month_updates(progress_state, n_sims * horizon_months)
+            _emit_progress_with_state(
                 progress_callback,
+                progress_state,
                 "cpu_fraction_eval_progress",
                 mode="parallel",
                 completed=int(completed),
@@ -2402,8 +2496,9 @@ def _collect_fraction_metrics_parallel(fractions_to_test, universe, config, exec
                 percent_complete=float(completed / total),
             )
 
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         "cpu_fraction_eval_complete",
         mode="parallel",
         total_fractions=int(len(tasks)),
@@ -2412,7 +2507,13 @@ def _collect_fraction_metrics_parallel(fractions_to_test, universe, config, exec
     return [results[idx] for idx in sorted(results)]
 
 
-def _collect_fraction_metrics(fractions_to_test, universe, config, progress_callback=None):
+def _collect_fraction_metrics(
+    fractions_to_test,
+    universe,
+    config,
+    progress_callback=None,
+    progress_state=None,
+):
     execution = _resolve_execution_settings(config, len(fractions_to_test))
     if execution["mode"] == "parallel":
         try:
@@ -2422,6 +2523,7 @@ def _collect_fraction_metrics(fractions_to_test, universe, config, progress_call
                 config,
                 execution,
                 progress_callback=progress_callback,
+                progress_state=progress_state,
             )
         except Exception as exc:
             execution["mode"] = "single"
@@ -2429,12 +2531,18 @@ def _collect_fraction_metrics(fractions_to_test, universe, config, progress_call
             execution["backend"] = "single"
             execution["start_method"] = None
             execution["fallback_reason"] = str(exc)
-            _emit_progress(progress_callback, "cpu_parallel_fallback", reason=str(exc))
+            _emit_progress_with_state(
+                progress_callback,
+                progress_state,
+                "cpu_parallel_fallback",
+                reason=str(exc),
+            )
             diagnostics = _collect_fraction_metrics_single_thread(
                 fractions_to_test,
                 universe,
                 config,
                 progress_callback=progress_callback,
+                progress_state=progress_state,
             )
     else:
         diagnostics = _collect_fraction_metrics_single_thread(
@@ -2442,6 +2550,7 @@ def _collect_fraction_metrics(fractions_to_test, universe, config, progress_call
             universe,
             config,
             progress_callback=progress_callback,
+            progress_state=progress_state,
         )
     return diagnostics, execution
 
@@ -2641,8 +2750,11 @@ def run_monte_carlo_optimization(config=None, verbose=True, progress_callback=No
     if primary_objective_mode == "consensus":
         objective_label_for_table = "Mean - lambda*CVaR"
 
-    _emit_progress(
+    progress_state = {"month_updates_computed": 0}
+
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         "run_start",
         n_sims=int(simulation["n_sims"]),
         n_fractions=int(decision_grid["num_points"]),
@@ -2657,14 +2769,25 @@ def run_monte_carlo_optimization(config=None, verbose=True, progress_callback=No
                 fractions_to_test,
                 merged_config,
                 progress_callback=progress_callback,
+                progress_state=progress_state,
             )
             n_sims_for_output = simulation["n_sims"]
         except Exception as exc:
             if not gpu["fallback_to_cpu_on_error"]:
-                _emit_progress(progress_callback, "run_failed", error=str(exc))
+                _emit_progress_with_state(
+                    progress_callback,
+                    progress_state,
+                    "run_failed",
+                    error=str(exc),
+                )
                 raise
             gpu_error = str(exc)
-            _emit_progress(progress_callback, "gpu_fallback_start", reason=gpu_error)
+            _emit_progress_with_state(
+                progress_callback,
+                progress_state,
+                "gpu_fallback_start",
+                reason=gpu_error,
+            )
             try:
                 streaming_fallback_cfg = _deep_merge(
                     merged_config,
@@ -2674,16 +2797,23 @@ def run_monte_carlo_optimization(config=None, verbose=True, progress_callback=No
                     fractions_to_test,
                     streaming_fallback_cfg,
                     progress_callback=progress_callback,
+                    progress_state=progress_state,
                 )
                 n_sims_for_output = simulation["n_sims"]
             except Exception as fallback_exc:
-                _emit_progress(progress_callback, "gpu_fallback_to_cpu", reason=str(fallback_exc))
+                _emit_progress_with_state(
+                    progress_callback,
+                    progress_state,
+                    "gpu_fallback_to_cpu",
+                    reason=str(fallback_exc),
+                )
                 universe = _generate_universe(merged_config)
                 diagnostics, execution = _collect_fraction_metrics(
                     fractions_to_test,
                     universe,
                     merged_config,
                     progress_callback=progress_callback,
+                    progress_state=progress_state,
                 )
                 universe_summary = universe["summary"]
                 n_sims_for_output = universe["n_sims"]
@@ -2694,6 +2824,7 @@ def run_monte_carlo_optimization(config=None, verbose=True, progress_callback=No
             universe,
             merged_config,
             progress_callback=progress_callback,
+            progress_state=progress_state,
         )
         universe_summary = universe["summary"]
         n_sims_for_output = universe["n_sims"]
@@ -2796,8 +2927,9 @@ def run_monte_carlo_optimization(config=None, verbose=True, progress_callback=No
         "reinvestment": reinvestment_metadata,
     }
 
-    _emit_progress(
+    _emit_progress_with_state(
         progress_callback,
+        progress_state,
         "run_complete",
         recommended_fraction=float(result["recommended_fraction"]),
         expected_final_net_worth=float(result["expected_final_net_worth"]),

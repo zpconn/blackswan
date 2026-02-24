@@ -1,16 +1,20 @@
 package app
 
 import (
+	"blackswan-tui/internal/service"
 	"blackswan-tui/internal/storage"
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+var ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func TestDefaultsLoadedDoesNotOverwritePinnedConfig(t *testing.T) {
 	t.Parallel()
@@ -275,6 +279,64 @@ func TestViewStaysWithinWindowHeightWhenPromptVisible(t *testing.T) {
 	}
 }
 
+func TestResizePanelsKeepsAllPaneTitlesVisible(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	sizedModel, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	sized := sizedModel.(Model)
+
+	view := stripANSI(sized.View())
+	lineCount := strings.Count(view, "\n") + 1
+	if lineCount > 30 {
+		t.Fatalf("expected view line count <= window height (%d), got %d", 30, lineCount)
+	}
+
+	for _, title := range []string{
+		"Config JSON",
+		"System Monitor",
+		"Month-to-Month Steps (So Far)",
+		"Live Telemetry",
+		"Results Explorer",
+		"Run History",
+	} {
+		if !strings.Contains(view, title) {
+			t.Fatalf("expected pane title %q to be visible in view", title)
+		}
+	}
+}
+
+func TestResizePanelsPrioritizesSystemMonitorVisibility(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	sizedModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	sized := sizedModel.(Model)
+
+	if sized.resourceH < minMonitorPanelHeight {
+		t.Fatalf("expected monitor panel height >= %d, got %d", minMonitorPanelHeight, sized.resourceH)
+	}
+	if !strings.Contains(stripANSI(sized.View()), "System Monitor") {
+		t.Fatalf("expected system monitor panel to remain visible in compact layout")
+	}
+}
+
+func TestViewAlwaysShowsComputeCounterPane(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	sizedModel, _ := m.Update(tea.WindowSizeMsg{Width: 110, Height: 24})
+	sized := sizedModel.(Model)
+
+	view := stripANSI(sized.View())
+	if !strings.Contains(view, "Month-to-Month Steps (So Far)") {
+		t.Fatalf("expected compute counter pane to always be visible, got %q", view)
+	}
+	if !strings.Contains(view, "Live Telemetry") {
+		t.Fatalf("expected live telemetry pane to remain visible in standard window size, got %q", view)
+	}
+}
+
 func TestHighlightJSONKeysStylesObjectFields(t *testing.T) {
 	t.Parallel()
 
@@ -336,27 +398,102 @@ func TestHighlightJSONKeysUsesDistinctStyleForObjectValuedKeys(t *testing.T) {
 	}
 }
 
-func TestRenderUsageTrendRightAlignsWhenHistoryShort(t *testing.T) {
+func TestRenderUsageWaveformRightAlignsWhenHistoryShort(t *testing.T) {
 	t.Parallel()
 
-	got := renderUsageTrend([]float64{50, 100}, 6)
-	if !strings.HasPrefix(got, "....") {
-		t.Fatalf("expected leading padding dots, got %q", got)
+	got := []rune(stripANSI(renderUsageWaveform([]float64{50, 100}, 6, 0.85, cpuWavePalette)))
+	if len(got) != 6 {
+		t.Fatalf("expected waveform width 6, got %d", len(got))
 	}
-	tailFromMinWidth := renderUsageTrend([]float64{50, 100}, 4)
-	wantTail := tailFromMinWidth[len(tailFromMinWidth)-2:]
-	if got[4:] != wantTail {
-		t.Fatalf("expected right-aligned tail %q, got %q", wantTail, got[4:])
+	if string(got[:4]) != strings.Repeat(string(waveformPadRune), 4) {
+		t.Fatalf("expected leading waveform padding, got %q", string(got))
+	}
+
+	tailFromMinWidth := []rune(stripANSI(renderUsageWaveform([]float64{50, 100}, 4, 0.85, cpuWavePalette)))
+	if string(got[4:]) != string(tailFromMinWidth[2:]) {
+		t.Fatalf("expected right-aligned tail %q, got %q", string(tailFromMinWidth[2:]), string(got[4:]))
 	}
 }
 
-func TestRenderUsageTrendUsesLatestWindow(t *testing.T) {
+func TestRenderUsageWaveformUsesLatestWindow(t *testing.T) {
 	t.Parallel()
 
-	full := renderUsageTrend([]float64{0, 10, 20, 30, 40, 50}, 4)
-	latestOnly := renderUsageTrend([]float64{20, 30, 40, 50}, 4)
+	full := stripANSI(renderUsageWaveform([]float64{0, 10, 20, 30, 40, 50}, 4, 0.4, cpuWavePalette))
+	latestOnly := stripANSI(renderUsageWaveform([]float64{20, 30, 40, 50}, 4, 0.4, cpuWavePalette))
 	if full != latestOnly {
-		t.Fatalf("expected trend to use latest window: full=%q latest=%q", full, latestOnly)
+		t.Fatalf("expected waveform to use latest window: full=%q latest=%q", full, latestOnly)
+	}
+}
+
+func TestRenderUsageWaveformClampsValues(t *testing.T) {
+	t.Parallel()
+
+	clamped := stripANSI(renderUsageWaveform([]float64{-10, 120, 220}, 7, 0.5, cpuWavePalette))
+	bounded := stripANSI(renderUsageWaveform([]float64{0, 100, 100}, 7, 0.5, cpuWavePalette))
+	if clamped != bounded {
+		t.Fatalf("expected waveform samples to clamp to [0,100], clamped=%q bounded=%q", clamped, bounded)
+	}
+}
+
+func TestRenderUsageWaveformPhaseAffectsOutput(t *testing.T) {
+	t.Parallel()
+
+	samples := []float64{12, 38, 44, 58, 73, 29, 65, 82}
+	first := stripANSI(renderUsageWaveform(samples, 16, 0.9, gpuWavePalette))
+	again := stripANSI(renderUsageWaveform(samples, 16, 0.9, gpuWavePalette))
+	shifted := stripANSI(renderUsageWaveform(samples, 16, 1.7, gpuWavePalette))
+	if first != again {
+		t.Fatalf("expected deterministic waveform at same phase, first=%q again=%q", first, again)
+	}
+	if first == shifted {
+		t.Fatalf("expected waveform to change when phase changes, first=%q shifted=%q", first, shifted)
+	}
+}
+
+func TestRenderUsageWaveformEmptyHistoryUsesBaseline(t *testing.T) {
+	t.Parallel()
+
+	got := stripANSI(renderUsageWaveform(nil, 7, 0, memWavePalette))
+	want := strings.Repeat(string(waveformPadRune), 7)
+	if got != want {
+		t.Fatalf("expected baseline waveform %q, got %q", want, got)
+	}
+}
+
+func TestRenderUsageWaveformRowsHighEnergyGetsUpperBand(t *testing.T) {
+	t.Parallel()
+
+	lowTop, _ := renderUsageWaveformRows([]float64{10, 12, 9, 15, 14}, 10, 0.6, cpuWavePalette)
+	highTop, _ := renderUsageWaveformRows([]float64{92, 96, 98, 94, 99}, 10, 0.6, cpuWavePalette)
+
+	if strings.TrimSpace(stripANSI(lowTop)) != "" {
+		t.Fatalf("expected low-energy waveform to keep upper row empty, got %q", stripANSI(lowTop))
+	}
+	if strings.TrimSpace(stripANSI(highTop)) == "" {
+		t.Fatalf("expected high-energy waveform to draw upper-row peaks, got %q", stripANSI(highTop))
+	}
+}
+
+func TestFormatApproxCountUsesWordUnitsForLargeValues(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		value float64
+		want  string
+	}{
+		{4_400_000, "4.4 million"},
+		{4_400_000_000, "4.4 billion"},
+		{14_500_000_000_000, "14.5 trillion"},
+	}
+	for _, tc := range cases {
+		got := formatApproxCount(tc.value)
+		if got != tc.want {
+			t.Fatalf("formatApproxCount(%v) => %q, want %q", tc.value, got, tc.want)
+		}
+	}
+
+	if got := formatApproxCount(6_000); got != "6.00K" {
+		t.Fatalf("expected thousands formatting to remain compact, got %q", got)
 	}
 }
 
@@ -423,6 +560,249 @@ func TestSystemMetricsCatchupAppendsMultipleSamples(t *testing.T) {
 	}
 	if len(next.gpuHistory) != 4 {
 		t.Fatalf("expected 4 gpu samples after catch-up, got %d", len(next.gpuHistory))
+	}
+}
+
+func TestWaveTickAdvancesPhaseAndSchedulesNextTick(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	initial := m.wavePhase
+
+	nextModel, cmd := m.Update(waveTickMsg{at: time.Now()})
+	next := nextModel.(Model)
+	if cmd == nil {
+		t.Fatalf("expected wave tick to schedule next animation tick")
+	}
+	if next.wavePhase == initial {
+		t.Fatalf("expected wave phase to advance, still %.2f", next.wavePhase)
+	}
+}
+
+func TestTelemetryCounterTracksMonthUpdatesFromProgressPayload(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	cfg := map[string]any{
+		"simulation": map[string]any{
+			"n_sims":         1000,
+			"horizon_months": 12,
+		},
+		"decision_grid": map[string]any{
+			"num_points": 5,
+		},
+	}
+
+	m.running = true
+	m.currentRunID = "run-1"
+	m.currentConfig = cfg
+	m.resetTelemetryEstimate(cfg)
+
+	nextModel, _ := m.Update(streamEventMsg{
+		streamID: m.streamID,
+		ok:       true,
+		events: []service.StreamEvent{
+			{
+				Seq:   1,
+				Event: "run_start",
+				Payload: map[string]any{
+					"n_sims":      1000,
+					"n_fractions": 5,
+				},
+			},
+			{
+				Seq:   2,
+				Event: "primary_pass_start",
+				Payload: map[string]any{
+					"n_sims":      1000,
+					"n_fractions": 5,
+				},
+			},
+			{
+				Seq:   3,
+				Event: "primary_pass_progress",
+				Payload: map[string]any{
+					"sims_completed":         100,
+					"sims_total":             1000,
+					"month_updates_computed": 6000,
+				},
+			},
+		},
+	})
+	next := nextModel.(Model)
+	if int64(next.monthUpdatesApprox) != 6000 {
+		t.Fatalf("expected month updates 6000, got %.0f", next.monthUpdatesApprox)
+	}
+	if !strings.Contains(stripANSI(next.renderComputeCounter()), "6.00K") {
+		t.Fatalf("expected compute counter pane content to include latest count, got %q", stripANSI(next.renderComputeCounter()))
+	}
+
+	finalModel, _ := next.Update(streamEventMsg{
+		streamID: next.streamID,
+		ok:       true,
+		events: []service.StreamEvent{
+			{
+				Seq:   4,
+				Event: "primary_pass_progress",
+				Payload: map[string]any{
+					"sims_completed":         250,
+					"sims_total":             1000,
+					"month_updates_computed": 15000,
+				},
+			},
+		},
+	})
+	finalState := finalModel.(Model)
+	if int64(finalState.monthUpdatesApprox) != 15000 {
+		t.Fatalf("expected month updates 15000, got %.0f", finalState.monthUpdatesApprox)
+	}
+}
+
+func TestTelemetryCounterTracksMonthUpdatesFromStatusPayload(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	cfg := map[string]any{
+		"simulation": map[string]any{
+			"n_sims":         1000,
+			"horizon_months": 12,
+		},
+		"decision_grid": map[string]any{
+			"num_points": 5,
+		},
+	}
+
+	m.running = true
+	m.currentRunID = "run-1"
+	m.currentConfig = cfg
+	m.resetTelemetryEstimate(cfg)
+
+	nextModel, _ := m.Update(runStatusMsg{
+		status: &service.RunStatus{
+			RunID:                "run-1",
+			Status:               "running",
+			LatestSeq:            7,
+			LatestEvent:          "primary_pass_progress",
+			LatestEventTimestamp: "2026-02-24T18:30:00Z",
+			LatestEventPayload: map[string]any{
+				"sims_completed":         250,
+				"sims_total":             1000,
+				"month_updates_computed": 15000,
+			},
+		},
+	})
+	next := nextModel.(Model)
+	if int64(next.monthUpdatesApprox) != 15000 {
+		t.Fatalf("expected month updates 15000 from runStatus payload, got %.0f", next.monthUpdatesApprox)
+	}
+}
+
+func TestRenderSystemMonitorUsesWaveformRows(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	m.resourceW = 54
+	m.resourceH = 9
+	m.wavePhase = 0.7
+	m.cpuUsagePct = 42
+	m.cpuHistory = []float64{18, 25, 30, 44, 51, 48}
+	m.memAvailable = true
+	m.memUsagePct = 67
+	m.memHistory = []float64{38, 40, 43, 49, 57, 60}
+	m.gpuAvailable = true
+	m.gpuUsagePct = 74
+	m.gpuHistory = []float64{45, 55, 62, 68, 74, 79}
+
+	plain := stripANSI(m.renderSystemMonitor())
+	if !regexp.MustCompile(`cpu~ [▁▂▃▄▅▆▇█]+`).MatchString(plain) {
+		t.Fatalf("expected cpu waveform row, got %q", plain)
+	}
+	if !regexp.MustCompile(`gpu~ [▁▂▃▄▅▆▇█]+`).MatchString(plain) {
+		t.Fatalf("expected gpu waveform row, got %q", plain)
+	}
+	if !regexp.MustCompile(`mem~ [▁▂▃▄▅▆▇█]+`).MatchString(plain) {
+		t.Fatalf("expected mem waveform row, got %q", plain)
+	}
+}
+
+func TestRenderSystemMonitorTallLayoutUsesTwoRowWaveforms(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	m.resourceW = 54
+	m.resourceH = fullMonitorPanelHeight
+	m.wavePhase = 0.7
+	m.cpuUsagePct = 91
+	m.cpuHistory = []float64{88, 90, 93, 95, 97, 96}
+	m.memAvailable = true
+	m.memUsagePct = 87
+	m.memHistory = []float64{82, 84, 88, 90, 91, 89}
+	m.gpuAvailable = true
+	m.gpuUsagePct = 94
+	m.gpuHistory = []float64{89, 92, 94, 96, 98, 97}
+
+	lines := strings.Split(stripANSI(m.renderSystemMonitor()), "\n")
+	if len(lines) < 9 {
+		t.Fatalf("expected tall monitor layout with expanded waveform rows, got %d lines (%q)", len(lines), strings.Join(lines, "\n"))
+	}
+
+	var cpuRow int = -1
+	for idx, line := range lines {
+		if strings.HasPrefix(line, "cpu~ ") {
+			cpuRow = idx
+			break
+		}
+	}
+	if cpuRow < 0 || cpuRow+1 >= len(lines) {
+		t.Fatalf("expected cpu waveform row and continuation row in tall layout")
+	}
+	if !strings.HasPrefix(lines[cpuRow+1], waveformContinuationPrefix) {
+		t.Fatalf("expected continuation prefix %q after cpu waveform row, got %q", waveformContinuationPrefix, lines[cpuRow+1])
+	}
+	if strings.TrimSpace(strings.TrimPrefix(lines[cpuRow], "cpu~ ")) == "" {
+		t.Fatalf("expected high-energy cpu waveform upper row to be non-empty, got %q", lines[cpuRow])
+	}
+}
+
+func TestRenderSystemMonitorCompactHeightKeepsGPUWaveRow(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	m.resourceW = 54
+	m.resourceH = 5 // 4 visible body lines in monitor panel
+	m.wavePhase = 0.9
+	m.cpuUsagePct = 38
+	m.cpuHistory = []float64{18, 23, 31, 40, 46, 52}
+	m.gpuAvailable = true
+	m.gpuUsagePct = 71
+	m.gpuHistory = []float64{42, 55, 63, 67, 73, 79}
+	m.memAvailable = true
+	m.memUsagePct = 64
+	m.memHistory = []float64{31, 35, 39, 44, 53, 58}
+
+	plain := stripANSI(m.renderSystemMonitor())
+	lines := strings.Split(plain, "\n")
+	if len(lines) != 4 {
+		t.Fatalf("expected compact monitor body with 4 lines, got %d (%q)", len(lines), plain)
+	}
+	if !strings.HasPrefix(lines[3], "gpu~ ") {
+		t.Fatalf("expected gpu waveform line in compact view, got %q", lines[3])
+	}
+}
+
+func TestRenderSystemMonitorKeepsGPUUnavailableMessage(t *testing.T) {
+	t.Parallel()
+
+	m := NewModel(nil, nil)
+	m.resourceW = 54
+	m.resourceH = 8
+	m.cpuHistory = []float64{22, 24, 26}
+	m.gpuAvailable = false
+	m.gpuNote = "driver missing"
+
+	plain := stripANSI(m.renderSystemMonitor())
+	if !strings.Contains(plain, "gpu~ unavailable: driver missing") {
+		t.Fatalf("expected gpu unavailable note in monitor, got %q", plain)
 	}
 }
 
@@ -524,4 +904,8 @@ func TestHistoryAutoScrollAccountsForWrappedRows(t *testing.T) {
 	if m.historyCursorTopLine > m.history.YOffset+m.history.Height-1 {
 		t.Fatalf("expected selected row top line to be in/before viewport bottom")
 	}
+}
+
+func stripANSI(raw string) string {
+	return ansiEscapePattern.ReplaceAllString(raw, "")
 }
